@@ -7,9 +7,9 @@ It gives forks their own UI instead of burying fork telemetry inside `pi-interco
 ## What it shows
 
 - Shared runtime helpers for fork handler paths/state, intercom identities, Pi fork args, environment flags, and detached process launch.
-- Source-scoped footer status while forks are running: running count, tokens, longest duration.
-- Source-scoped widget detail: source extension, status, label, duration, token usage, pid, and intercom target.
-- `/forks <source>` command for active/stale forks for one source.
+- Source-scoped footer status while forks are running: a green growing fork icon, running count, and `Ctrl+Alt+F` shortcut hint.
+- A small, color-coded modal for fork details: source extension, status, label, duration, and token usage by default.
+- `Ctrl+Alt+F` or `/forks` opens the current chat by default. The modal has toggles for `t` related-only, `c` completed, `s` sort mode, and `v` reverse sort; press `a` to cycle scopes: this chat, response handlers, subagents, user forks, all forks. Close with `Esc` or `q`.
 - `/forks <source> --all` to include completed, failed, and unknown handlers for that source.
 - `/forks --all-sources` for the intentional global view.
 
@@ -22,13 +22,13 @@ Currently it reads existing state from:
 
 Running counts are authoritative when the source extension writes pid/status metadata. Older `pi-subagents` handler dirs without a shared record are shown as `unknown` only in `--all` views.
 
-By default the extension does **not** render a global all-source widget. To opt into an automatic widget for one source, set:
+By default the extension does **not** render a global all-source footer indicator. To opt into an automatic footer indicator for one source, set:
 
 ```bash
 PI_FORKS_SOURCE=return_on # or intercom, subagents
 ```
 
-This keeps each extension's default display scoped to forks related to itself. Use `--all-sources` only when you explicitly want the global monitor.
+This keeps the default footer scoped to forks related to the current chat/session. Related means the fork names this chat as its parent, this chat is itself the fork session, or the fork shares the same cwd when no parent metadata is available. Fresh sessions stay quiet until they start their own fork. Use `--all-sources`, turn related-only off with `t`, or choose the modal's `all forks` scope only when you explicitly want the global monitor. The footer stays intentionally tiny with one growing pixel-fork icon, for example `┌┬┐ 1 · Ctrl+Alt+F`, `┌┬┬┐ 2 · Ctrl+Alt+F`, up to `┌┬┬┬┬┐+ N · Ctrl+Alt+F`; when other sessions also have forks, the icon can grow from the global running count while the number stays scoped, e.g. `1/2` means one fork in this chat out of two total.
 
 ## Shared runtime
 
@@ -65,9 +65,13 @@ Or add it to Pi settings as a local package/extension during development.
 ## Commands
 
 ```text
-/forks intercom          show active/stale pi-intercom fork handlers
-/forks return_on         show active/stale pi-return-on fork handlers
-/forks subagents         show active/stale pi-subagents fork handlers
+Ctrl+Alt+F              open compact fork handlers modal
+/forks intercom          open active/stale pi-intercom fork handlers
+/forks return_on         open active/stale pi-return-on fork handlers
+/forks subagents         open active/stale pi-subagents fork handlers
+/forks --related         force related-only filtering
+/forks --unrelated       turn related-only filtering off
+/forks --sort=newest     sort by status/newest/oldest/duration/source/label
 /forks return_on --all   include completed/failed/unknown for that source
 /forks --all-sources     intentional global active/stale view
 /forks --all-sources -a  intentional global view including completed records

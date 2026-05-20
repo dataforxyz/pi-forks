@@ -28,6 +28,9 @@ export interface ForkRun {
 	intercomTarget?: string;
 	intercomStatusTag?: string;
 	parentIntercomTarget?: string;
+	parentSessionFile?: string;
+	parentSessionId?: string;
+	parentSessionName?: string;
 	detail?: string;
 }
 
@@ -44,6 +47,10 @@ export interface ScanOptions {
 	includeCompleted?: boolean;
 	limit?: number;
 	source?: ForkSource | ForkSource[];
+	parentSessionFile?: string;
+	parentSessionId?: string;
+	parentSessionName?: string;
+	userOnly?: boolean;
 }
 
 interface IntercomHandlersState {
@@ -161,6 +168,9 @@ function mapIntercomRun(run: Record<string, unknown>, now: number): ForkRun | un
 	const messageId = stringValue(run.messageId);
 	const sessionDir = stringValue(run.sessionDir);
 	const parentIntercomTarget = stringValue(run.parentIntercomTarget) ?? stringValue(run.parentSessionName);
+	const parentSessionFile = stringValue(run.parentSessionFile);
+	const parentSessionId = stringValue(run.parentSessionId);
+	const parentSessionName = stringValue(run.parentSessionName);
 	return {
 		source: "intercom",
 		id,
@@ -173,6 +183,9 @@ function mapIntercomRun(run: Record<string, unknown>, now: number): ForkRun | un
 		...(stringValue(run.dir) ? { dir: stringValue(run.dir) } : {}),
 		...(sessionDir ? { sessionDir } : {}),
 		...(parentIntercomTarget ? { parentIntercomTarget } : {}),
+		...(parentSessionFile ? { parentSessionFile } : {}),
+		...(parentSessionId ? { parentSessionId } : {}),
+		...(parentSessionName ? { parentSessionName } : {}),
 		...(startedAt !== undefined ? { startedAt } : {}),
 		...(endedAt !== undefined ? { endedAt } : {}),
 		...(computeDuration(startedAt, endedAt, now) !== undefined ? { durationMs: computeDuration(startedAt, endedAt, now) } : {}),
@@ -191,6 +204,9 @@ function mapReturnOnRun(run: Record<string, unknown>, now: number): ForkRun | un
 	const sessionDir = stringValue(run.sessionDir);
 	const label = stringValue(run.label) ?? stringValue(run.jobId) ?? id;
 	const parentIntercomTarget = stringValue(run.parentIntercomTarget) ?? stringValue(run.parentSessionName);
+	const parentSessionFile = stringValue(run.parentSessionFile);
+	const parentSessionId = stringValue(run.parentSessionId);
+	const parentSessionName = stringValue(run.parentSessionName);
 	return {
 		source: "return_on",
 		id,
@@ -203,6 +219,9 @@ function mapReturnOnRun(run: Record<string, unknown>, now: number): ForkRun | un
 		...(stringValue(run.dir) ? { dir: stringValue(run.dir) } : {}),
 		...(sessionDir ? { sessionDir } : {}),
 		...(parentIntercomTarget ? { parentIntercomTarget } : {}),
+		...(parentSessionFile ? { parentSessionFile } : {}),
+		...(parentSessionId ? { parentSessionId } : {}),
+		...(parentSessionName ? { parentSessionName } : {}),
 		...(startedAt !== undefined ? { startedAt } : {}),
 		...(endedAt !== undefined ? { endedAt } : {}),
 		...(computeDuration(startedAt, endedAt, now) !== undefined ? { durationMs: computeDuration(startedAt, endedAt, now) } : {}),
@@ -221,6 +240,9 @@ function mapSubagentRun(run: Record<string, unknown>, now: number): ForkRun | un
 	const sessionDir = stringValue(run.sessionDir);
 	const title = stringValue(run.title) ?? id;
 	const parentIntercomTarget = stringValue(run.parentIntercomTarget) ?? stringValue(run.parentSessionName);
+	const parentSessionFile = stringValue(run.parentSessionFile);
+	const parentSessionId = stringValue(run.parentSessionId);
+	const parentSessionName = stringValue(run.parentSessionName);
 	return {
 		source: "subagents",
 		id,
@@ -233,6 +255,9 @@ function mapSubagentRun(run: Record<string, unknown>, now: number): ForkRun | un
 		...(stringValue(run.dir) ? { dir: stringValue(run.dir) } : {}),
 		...(sessionDir ? { sessionDir } : {}),
 		...(parentIntercomTarget ? { parentIntercomTarget } : {}),
+		...(parentSessionFile ? { parentSessionFile } : {}),
+		...(parentSessionId ? { parentSessionId } : {}),
+		...(parentSessionName ? { parentSessionName } : {}),
 		...(startedAt !== undefined ? { startedAt } : {}),
 		...(endedAt !== undefined ? { endedAt } : {}),
 		...(computeDuration(startedAt, endedAt, now) !== undefined ? { durationMs: computeDuration(startedAt, endedAt, now) } : {}),
@@ -257,6 +282,9 @@ function mapSubagentDir(dir: string, now: number): ForkRun | undefined {
 	const title = stringValue(event?.title) ?? id;
 	const startedAt = statTime(path.join(dir, "prompt.md")) ?? statTime(dir);
 	const parentIntercomTarget = stringValue(event?.parentIntercomTarget) ?? stringValue(event?.parentSessionName);
+	const parentSessionFile = stringValue(event?.parentSessionFile);
+	const parentSessionId = stringValue(event?.parentSessionId);
+	const parentSessionName = stringValue(event?.parentSessionName);
 	return {
 		source: "subagents",
 		id,
@@ -267,6 +295,9 @@ function mapSubagentDir(dir: string, now: number): ForkRun | undefined {
 		dir,
 		sessionDir,
 		...(parentIntercomTarget ? { parentIntercomTarget } : {}),
+		...(parentSessionFile ? { parentSessionFile } : {}),
+		...(parentSessionId ? { parentSessionId } : {}),
+		...(parentSessionName ? { parentSessionName } : {}),
 		...(startedAt !== undefined ? { startedAt } : {}),
 		...(computeDuration(startedAt, undefined, now) !== undefined ? { durationMs: computeDuration(startedAt, undefined, now) } : {}),
 		...(eventType ? { detail: eventType } : {}),
@@ -320,7 +351,11 @@ export function scanForkRuns(options: ScanOptions = {}): ForkSummary {
 		...scanSubagentForkDirs(getForkHandlersDir("subagents", homeDir), now).filter((run) => !persistedSubagentIds.has(run.id)),
 	];
 	const sourceFilter = options.source ? new Set(Array.isArray(options.source) ? options.source : [options.source]) : undefined;
-	const scoped = sourceFilter ? runs.filter((run) => sourceFilter.has(run.source)) : runs;
+	let scoped = sourceFilter ? runs.filter((run) => sourceFilter.has(run.source)) : runs;
+	if (options.parentSessionFile) scoped = scoped.filter((run) => run.parentSessionFile === options.parentSessionFile);
+	if (options.parentSessionId) scoped = scoped.filter((run) => run.parentSessionId === options.parentSessionId);
+	if (options.parentSessionName) scoped = scoped.filter((run) => run.parentSessionName === options.parentSessionName);
+	if (options.userOnly) scoped = scoped.filter((run) => !run.parentSessionFile && !run.parentSessionId && !run.parentSessionName && !run.parentIntercomTarget);
 	const filtered = scoped.filter((run) => options.includeCompleted || run.status === "running" || run.status === "starting" || run.status === "stale");
 	const sorted = sortRuns(filtered);
 	const limited = options.limit !== undefined ? sorted.slice(0, options.limit) : sorted;

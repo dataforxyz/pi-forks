@@ -5,6 +5,10 @@ const EXTENSION_KEY = "pi-forks";
 const WIDGET_KEY = "pi-forks";
 const REFRESH_MS = 2_000;
 const WIDGET_LIMIT = 8;
+const FORKS_SHORTCUT = "ctrl+alt+f";
+const FORKS_SHORTCUT_ALIAS = "alt+ctrl+f";
+const FORKS_SHORTCUT_LABEL = "Ctrl+Alt+F";
+const FORKS_MODAL_BODY_LINES = 12;
 const SOURCES: ForkSource[] = ["intercom", "return_on", "subagents"];
 
 interface ThemeLike {
@@ -12,10 +16,25 @@ interface ThemeLike {
 	bold(text: string): string;
 }
 
+type ViewScope = "chat" | "response_handlers" | "subagents" | "user" | "all";
+type SortMode = "status" | "newest" | "oldest" | "duration" | "source" | "label";
+
+const SCOPE_ORDER: ViewScope[] = ["chat", "response_handlers", "subagents", "user", "all"];
+const SORT_ORDER: SortMode[] = ["status", "newest", "oldest", "duration", "source", "label"];
+
 interface ViewOptions {
-	source?: ForkSource;
+	source?: ForkSource | ForkSource[];
 	includeCompleted?: boolean;
 	allSources?: boolean;
+	scope?: ViewScope;
+	parentSessionFile?: string;
+	parentSessionId?: string;
+	parentSessionName?: string;
+	cwd?: string;
+	userOnly?: boolean;
+	relatedOnly?: boolean;
+	sortMode?: SortMode;
+	sortDesc?: boolean;
 }
 
 let latestCtx: ExtensionContext | undefined;
@@ -26,12 +45,43 @@ function configuredSource(): ForkSource | undefined {
 	return SOURCES.includes(raw as ForkSource) ? raw as ForkSource : undefined;
 }
 
+function inferSourceFromPath(value: string | undefined): ForkSource | undefined {
+	if (!value) return undefined;
+	if (/pi-return-on|return_on/i.test(value)) return "return_on";
+	if (/pi-intercom|intercom/i.test(value)) return "intercom";
+	if (/pi-subagents|subagents/i.test(value)) return "subagents";
+	return undefined;
+}
+
+function relatedSource(ctx?: ExtensionContext): ForkSource | undefined {
+	return configuredSource() ?? inferSourceFromPath(ctx?.cwd) ?? inferSourceFromPath(process.cwd());
+}
+
+function parseScope(word: string): ViewScope | undefined {
+	if (["chat", "current", "current-chat", "this-chat", "session"].includes(word)) return "chat";
+	if (["responses", "response", "response-handlers", "handlers"].includes(word)) return "response_handlers";
+	if (["subagent", "subagents"].includes(word)) return "subagents";
+	if (["user", "manual", "user-forks"].includes(word)) return "user";
+	if (["all", "global", "all-sources"].includes(word)) return "all";
+	return undefined;
+}
+
+function parseSortMode(word: string): SortMode | undefined {
+	const cleaned = word.replace(/^--sort=?/, "");
+	return SORT_ORDER.includes(cleaned as SortMode) ? cleaned as SortMode : undefined;
+}
+
 function parseArgs(args: string): ViewOptions {
 	const words = args.trim().split(/\s+/).filter(Boolean);
 	const allSources = words.some((word) => word === "--all-sources" || word === "--global");
 	const includeCompleted = words.some((word) => word === "--all" || word === "-a");
+	const relatedFlag = words.some((word) => word === "--related");
+	const unrelatedFlag = words.some((word) => word === "--unrelated" || word === "--not-related");
 	const source = words.find((word): word is ForkSource => SOURCES.includes(word as ForkSource));
-	return { source, includeCompleted, allSources };
+	const scope = words.map(parseScope).find((value): value is ViewScope => !!value);
+	const sortMode = words.map(parseSortMode).find((value): value is SortMode => !!value);
+	const sortDesc = words.some((word) => word === "--desc" || word === "--reverse");
+	return { source, includeCompleted, allSources, sortDesc, ...(relatedFlag || unrelatedFlag ? { relatedOnly: relatedFlag && !unrelatedFlag } : {}), ...(scope ? { scope } : {}), ...(sortMode ? { sortMode } : {}) };
 }
 
 function formatDuration(ms: number | undefined): string {
@@ -56,15 +106,34 @@ function truncate(text: string, max: number): string {
 	return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
 }
 
+function stripAnsi(text: string): string {
+	return text.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function visibleLength(text: string): number {
+	return stripAnsi(text).length;
+}
+
 function sourceLabel(source: ForkRun["source"]): string {
 	if (source === "return_on") return "return_on";
 	if (source === "intercom") return "intercom";
 	return "subagents";
 }
 
-function sourceTitle(source: ForkSource | undefined, allSources: boolean): string {
+function scopeLabel(options: ViewOptions): string {
+	if (options.scope === "chat") return "this chat";
+	if (options.scope === "response_handlers") return "response handlers";
+	if (options.scope === "subagents") return "subagents";
+	if (options.scope === "user") return "user forks";
+	if (options.scope === "all" || options.allSources) return "all forks";
+	if (Array.isArray(options.source)) return options.source.map(sourceLabel).join("+");
+	return options.source ? sourceLabel(options.source) : "forks";
+}
+
+function sourceTitle(source: ForkSource | ForkSource[] | undefined, allSources: boolean): string {
 	if (allSources) return "All fork handlers";
 	if (!source) return "Fork handlers";
+	if (Array.isArray(source)) return `${source.map(sourceLabel).join("+")} forks`;
 	return `${sourceLabel(source)} forks`;
 }
 
@@ -90,6 +159,11 @@ function statusGlyph(status: ForkRun["status"]): string {
 	return "?";
 }
 
+function forkIcon(count: number): string {
+	const prongs = Math.max(3, Math.min(6, count + 2));
+	return `┌${"┬".repeat(Math.max(1, prongs - 2))}┐${count > 4 ? "+" : ""}`;
+}
+
 function runStats(run: ForkRun, theme?: ThemeLike): string {
 	const status = theme ? theme.fg(statusColor(run.status), run.status) : run.status;
 	const parts: string[] = [status];
@@ -99,14 +173,73 @@ function runStats(run: ForkRun, theme?: ThemeLike): string {
 	return parts.join(" · ");
 }
 
-function buildStatus(summary: ForkSummary, options: ViewOptions, theme?: ThemeLike): string | undefined {
+function compactRunStats(run: ForkRun): string {
+	const parts: string[] = [run.status];
+	if (run.durationMs !== undefined) parts.push(formatDuration(run.durationMs));
+	if (run.tokens?.total) parts.push(`${formatTokens(run.tokens.total)} tok`);
+	return parts.join(" · ");
+}
+
+function fileInsideDir(file: string | undefined, dir: string | undefined): boolean {
+	if (!file || !dir) return false;
+	const normalizedDir = dir.endsWith("/") ? dir : `${dir}/`;
+	return file === dir || file.startsWith(normalizedDir);
+}
+
+function runMatchesCurrentSession(run: ForkRun, options: ViewOptions): boolean {
+	if (options.parentSessionFile && run.parentSessionFile === options.parentSessionFile) return true;
+	if (options.parentSessionId && run.parentSessionId === options.parentSessionId) return true;
+	if (options.parentSessionName && (run.parentSessionName === options.parentSessionName || run.parentIntercomTarget === options.parentSessionName)) return true;
+	// Vice versa: this Pi chat may itself be the fork session being monitored.
+	if (fileInsideDir(options.parentSessionFile, run.sessionDir)) return true;
+	// User/manual forks often lack parent metadata; same cwd is only considered
+	// related inside the explicit user-forks scope, so fresh chats stay quiet.
+	if ((options.scope === "user" || options.userOnly) && options.cwd && run.cwd && run.cwd === options.cwd) return true;
+	return false;
+}
+
+function rebuildSummary(runs: ForkRun[]): ForkSummary {
+	const running = runs.filter((run) => run.status === "running" || run.status === "starting");
+	const totalTokens = runs.reduce((acc, run) => {
+		acc.input += run.tokens?.input ?? 0;
+		acc.output += run.tokens?.output ?? 0;
+		acc.total += run.tokens?.total ?? 0;
+		return acc;
+	}, { input: 0, output: 0, total: 0 });
+	const maxRunningDurationMs = running.reduce((max, run) => Math.max(max, run.durationMs ?? 0), 0);
+	return { runs, running, totalTokens, maxRunningDurationMs };
+}
+
+function sortValue(run: ForkRun, mode: SortMode): string | number {
+	if (mode === "newest" || mode === "oldest") return run.startedAt ?? 0;
+	if (mode === "duration") return run.durationMs ?? 0;
+	if (mode === "source") return sourceLabel(run.source);
+	if (mode === "label") return run.label.toLowerCase();
+	const rank: Record<ForkRun["status"], number> = { running: 0, starting: 1, stale: 2, failed: 3, unknown: 4, complete: 5 };
+	return rank[run.status];
+}
+
+function sortRunsForView(runs: ForkRun[], mode: SortMode, reverse: boolean): ForkRun[] {
+	const defaultDesc = mode === "newest" || mode === "duration";
+	const desc = reverse ? !defaultDesc : defaultDesc;
+	return [...runs].sort((a, b) => {
+		const av = sortValue(a, mode);
+		const bv = sortValue(b, mode);
+		let cmp = typeof av === "number" && typeof bv === "number" ? av - bv : String(av).localeCompare(String(bv));
+		if (cmp === 0) cmp = (b.startedAt ?? 0) - (a.startedAt ?? 0);
+		return desc ? -cmp : cmp;
+	});
+}
+
+function buildStatus(summary: ForkSummary, _options: ViewOptions, theme?: ThemeLike): string | undefined {
 	if (summary.running.length === 0) return undefined;
-	const label = options.allSources ? "forks" : options.source ? sourceLabel(options.source) : "forks";
-	const parts = [`${summary.running.length} ${label}`];
-	if (summary.totalTokens.total > 0) parts.push(`${formatTokens(summary.totalTokens.total)} tok`);
-	if (summary.maxRunningDurationMs > 0) parts.push(formatDuration(summary.maxRunningDurationMs));
-	const text = `⑂ ${parts.join(" · ")}`;
-	return theme ? theme.fg(options.source ? sourceColor(options.source) : "accent", text) : text;
+	const globalRunning = summarize({ allSources: true }).running.length;
+	const iconText = forkIcon(Math.max(summary.running.length, globalRunning));
+	const icon = theme ? theme.fg("success", iconText) : iconText;
+	const countText = globalRunning > summary.running.length ? `${summary.running.length}/${globalRunning}` : String(summary.running.length);
+	const count = theme ? theme.fg("success", countText) : countText;
+	const hint = theme ? theme.fg("dim", FORKS_SHORTCUT_LABEL) : FORKS_SHORTCUT_LABEL;
+	return `${icon} ${count} · ${hint}`;
 }
 
 function buildWidget(summary: ForkSummary, options: ViewOptions, theme?: ThemeLike): string[] | undefined {
@@ -152,31 +285,279 @@ function formatRunLine(run: ForkRun, theme?: ThemeLike): string {
 }
 
 function formatCommandOutput(summary: ForkSummary, options: ViewOptions, theme?: ThemeLike): string {
-	if (summary.runs.length === 0) return `No ${sourceTitle(options.source, !!options.allSources).toLowerCase()} found.`;
-	const title = theme ? theme.fg(options.source ? sourceColor(options.source) : "accent", theme.bold(sourceTitle(options.source, !!options.allSources))) : sourceTitle(options.source, !!options.allSources);
+	const titleText = scopeLabel(options);
+	if (summary.runs.length === 0) return `No ${titleText.toLowerCase()} found.`;
+	const title = theme ? theme.fg("accent", theme.bold(titleText)) : titleText;
 	const header = `${title}: ${summary.running.length} running, ${summary.runs.length} tracked, ${formatTokens(summary.totalTokens.total)} tokens`;
 	return [header, "", ...summary.runs.map((run) => formatRunLine(run, theme))].join("\n");
 }
 
+function matchesInput(data: string, key: string): boolean {
+	const aliases: Record<string, string[]> = {
+		escape: ["\u001b", "escape", "esc", "\u001b[27u", "\u001b[27;1u", "\u001b[27;1;27~"],
+		enter: ["\r", "\n", "return", "enter"],
+		up: ["\u001b[A", "up", "\u001b[1;1A"],
+		down: ["\u001b[B", "down", "\u001b[1;1B"],
+		pageUp: ["\u001b[5~", "pageup", "page-up"],
+		pageDown: ["\u001b[6~", "pagedown", "page-down"],
+		home: ["\u001b[H", "\u001b[1~", "home"],
+		end: ["\u001b[F", "\u001b[4~", "end"],
+	};
+	if (aliases[key]?.includes(data)) return true;
+	if (key === "escape") return /^\u001b\[(?:27;1;27~|27(?:;1)?u)$/.test(data);
+	return false;
+}
+
+class ForksModal {
+	private selectedIndex = 0;
+	private scroll = 0;
+	private includeCompleted: boolean;
+	private relatedOnly: boolean;
+	private scope: ViewScope | undefined;
+	private sortMode: SortMode;
+	private sortDesc: boolean;
+	private cachedLines: string[] | undefined;
+	private cachedWidth: number | undefined;
+	private options: ViewOptions;
+	private theme: ThemeLike;
+	private done: () => void;
+
+	constructor(options: ViewOptions, theme: ThemeLike, done: () => void) {
+		this.options = options;
+		this.theme = theme;
+		this.done = done;
+		this.includeCompleted = !!options.includeCompleted;
+		this.relatedOnly = options.relatedOnly ?? true;
+		this.scope = options.scope ?? (options.allSources ? "all" : undefined);
+		this.sortMode = options.sortMode ?? "status";
+		this.sortDesc = !!options.sortDesc;
+	}
+
+	handleInput(data: string): void {
+		// Close keys must be handled before rescanning fork state. If a scan is slow
+		// or a state file is temporarily wedged, Esc/q should still dismiss the modal.
+		if (data === "\u0003" || data === FORKS_SHORTCUT || data === FORKS_SHORTCUT_ALIAS || matchesInput(data, "escape") || data === "q" || data === "Q") {
+			this.done();
+			return;
+		}
+		const summary = this.summary();
+		this.clampSelection(summary.runs.length);
+		const maxScroll = Math.max(0, this.getCachedBodyLength() - FORKS_MODAL_BODY_LINES);
+		if (data === "a") {
+			const current = this.scope ?? "chat";
+			this.scope = SCOPE_ORDER[(SCOPE_ORDER.indexOf(current) + 1) % SCOPE_ORDER.length] ?? "chat";
+			this.resetView();
+		} else if (data === "t") {
+			this.relatedOnly = !this.relatedOnly;
+			this.resetView();
+		} else if (data === "c") {
+			this.includeCompleted = !this.includeCompleted;
+			this.resetView();
+		} else if (data === "s") {
+			this.sortMode = SORT_ORDER[(SORT_ORDER.indexOf(this.sortMode) + 1) % SORT_ORDER.length] ?? "status";
+			this.resetView();
+		} else if (data === "v") {
+			this.sortDesc = !this.sortDesc;
+			this.resetView();
+		} else if (data === "r") {
+			this.invalidate();
+		} else if (data === "j" || matchesInput(data, "down")) {
+			this.selectedIndex = Math.min(summary.runs.length - 1, this.selectedIndex + 1);
+			this.ensureSelectedVisible();
+		} else if (data === "k" || matchesInput(data, "up")) {
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+			this.ensureSelectedVisible();
+		} else if (matchesInput(data, "pageDown")) {
+			this.selectedIndex = Math.min(summary.runs.length - 1, this.selectedIndex + FORKS_MODAL_BODY_LINES - 6);
+			this.ensureSelectedVisible();
+		} else if (matchesInput(data, "pageUp")) {
+			this.selectedIndex = Math.max(0, this.selectedIndex - (FORKS_MODAL_BODY_LINES - 6));
+			this.ensureSelectedVisible();
+		} else if (matchesInput(data, "home")) {
+			this.selectedIndex = 0;
+			this.ensureSelectedVisible();
+		} else if (matchesInput(data, "end")) {
+			this.selectedIndex = Math.max(0, summary.runs.length - 1);
+			this.ensureSelectedVisible();
+		} else if (data === "J") this.scroll = Math.min(maxScroll, this.scroll + 1);
+		else if (data === "K") this.scroll = Math.max(0, this.scroll - 1);
+		else return;
+		this.invalidate();
+	}
+
+	render(width: number): string[] {
+		const frameWidth = Math.max(56, width);
+		const innerWidth = Math.max(20, frameWidth - 4);
+		const summary = this.summary();
+		this.clampSelection(summary.runs.length);
+		const body = this.getBodyLines(innerWidth, summary);
+		const maxScroll = Math.max(0, body.length - FORKS_MODAL_BODY_LINES);
+		this.scroll = Math.min(this.scroll, maxScroll);
+		const visibleBody = body.slice(this.scroll, this.scroll + FORKS_MODAL_BODY_LINES);
+		const scope = scopeLabel({ ...this.options, scope: this.scope, allSources: this.scope === "all" });
+		const globalRunning = summarize({ scope: "all" }).running.length;
+		const titleCount = globalRunning > summary.running.length ? `${summary.running.length} running/${globalRunning} total` : `${summary.running.length} running`;
+		const title = `${this.theme.fg("success", forkIcon(Math.max(summary.running.length, globalRunning)))} ${this.theme.fg("accent", "fork handlers")} ${this.theme.fg("dim", `${titleCount} · ${summary.runs.length} shown · ${scope}`)}`;
+		const range = body.length > FORKS_MODAL_BODY_LINES ? ` · lines ${this.scroll + 1}-${Math.min(body.length, this.scroll + FORKS_MODAL_BODY_LINES)}/${body.length}` : "";
+		const help = this.theme.fg("dim", `↑/↓ select · a scope · t related · c completed · s sort · v reverse · Esc/q close${range}`);
+		return [
+			this.theme.fg("muted", this.border("┌", "┐", frameWidth)),
+			this.frameLine(title, frameWidth),
+			this.theme.fg("muted", this.border("├", "┤", frameWidth)),
+			...visibleBody.map((line) => this.frameLine(line, frameWidth)),
+			...(visibleBody.length === 0 ? [this.frameLine("", frameWidth)] : []),
+			this.theme.fg("muted", this.border("├", "┤", frameWidth)),
+			this.frameLine(help, frameWidth),
+			this.theme.fg("muted", this.border("└", "┘", frameWidth)),
+		];
+	}
+
+	private summary(): ForkSummary {
+		return summarize({ ...this.options, scope: this.scope, includeCompleted: this.includeCompleted, relatedOnly: this.relatedOnly, sortMode: this.sortMode, sortDesc: this.sortDesc, allSources: this.scope === "all" });
+	}
+
+	private resetView(): void {
+		this.scroll = 0;
+		this.selectedIndex = 0;
+		this.invalidate();
+	}
+
+	private invalidate(): void {
+		this.cachedLines = undefined;
+		this.cachedWidth = undefined;
+	}
+
+	private clampSelection(count: number): void {
+		if (count <= 0) {
+			this.selectedIndex = 0;
+			return;
+		}
+		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, count - 1));
+	}
+
+	private ensureSelectedVisible(): void {
+		const row = 3 + this.selectedIndex;
+		if (row < this.scroll) this.scroll = row;
+		else if (row >= this.scroll + FORKS_MODAL_BODY_LINES) this.scroll = row - FORKS_MODAL_BODY_LINES + 1;
+		this.scroll = Math.max(0, this.scroll);
+	}
+
+	private getCachedBodyLength(): number {
+		return this.cachedLines?.length ?? 0;
+	}
+
+	private getBodyLines(innerWidth: number, summary: ForkSummary): string[] {
+		this.clampSelection(summary.runs.length);
+		const lines: string[] = [];
+		const push = (line = "") => lines.push(line);
+		const scope = scopeLabel({ ...this.options, scope: this.scope, allSources: this.scope === "all" });
+		push(`${this.theme.fg("dim", "Scope:")} ${this.theme.fg("accent", scope)} ${this.theme.fg("muted", "· related:")} ${this.theme.fg("accent", this.relatedOnly ? "only" : "off")} ${this.theme.fg("muted", "· completed:")} ${this.theme.fg("accent", this.includeCompleted ? "shown" : "hidden")} ${this.theme.fg("muted", "· sort:")} ${this.theme.fg("accent", `${this.sortMode}${this.sortDesc ? " reversed" : ""}`)}`);
+		if (summary.runs.length === 0) {
+			push(this.theme.fg("warning", `No fork handlers for ${scope}.`));
+		} else {
+			for (const [index, run] of summary.runs.entries()) push(this.formatRunRow(run, index, innerWidth));
+		}
+		this.cachedLines = lines;
+		this.cachedWidth = innerWidth;
+		return lines;
+	}
+
+	private formatRunRow(run: ForkRun, index: number, innerWidth: number): string {
+		const selected = index === this.selectedIndex;
+		const marker = selected ? this.theme.fg("accent", "›") : " ";
+		const number = selected ? this.theme.fg("accent", `${index + 1}.`) : this.theme.fg("dim", `${index + 1}.`);
+		const glyph = this.theme.fg(statusColor(run.status), statusGlyph(run.status));
+		const source = this.theme.fg(sourceColor(run.source), sourceLabel(run.source));
+		const labelBudget = Math.max(16, Math.min(48, innerWidth - 58));
+		const label = this.theme.fg("accent", truncate(run.label, labelBudget));
+		const stats = this.theme.fg("dim", compactRunStats(run));
+		return `${marker} ${number} ${glyph} ${source} ${label} ${this.theme.fg("muted", "·")} ${stats}`;
+	}
+
+	private border(left: string, right: string, width: number): string {
+		return `${left}${"─".repeat(Math.max(0, width - 2))}${right}`;
+	}
+
+	private frameLine(content: string, width: number): string {
+		const innerWidth = Math.max(1, width - 4);
+		let text = content;
+		if (visibleLength(text) > innerWidth) text = `${stripAnsi(text).slice(0, Math.max(0, innerWidth - 1))}…`;
+		const padding = " ".repeat(Math.max(0, innerWidth - visibleLength(text)));
+		return `│ ${text}${padding} │`;
+	}
+}
+
+async function showForksModal(ctx: ExtensionContext, options: ViewOptions): Promise<void> {
+	latestCtx = ctx;
+	const summary = summarize(options);
+	if (!ctx.hasUI || typeof ctx.ui.custom !== "function") {
+		ctx.ui.notify(formatCommandOutput(summary, options, ctx.ui.theme), "info");
+		return;
+	}
+	await ctx.ui.custom<void>(
+		(_tui, theme, _keybindings, done) => new ForksModal(options, theme, done),
+		{
+			overlay: true,
+			overlayOptions: {
+				width: "72%",
+				minWidth: 54,
+				maxHeight: "60%",
+				anchor: "center",
+				margin: 1,
+			},
+		},
+	);
+	render(ctx);
+}
+
 function summarize(options: ViewOptions): ForkSummary {
-	return scanForkRuns({
+	const scope = options.scope;
+	const allSources = options.allSources || scope === "all" || scope === "chat";
+	const source = scope === "response_handlers"
+		? ["return_on", "intercom"] as ForkSource[]
+		: scope === "subagents"
+			? "subagents" as ForkSource
+			: options.source;
+	const scanned = scanForkRuns({
 		includeCompleted: options.includeCompleted,
-		...(options.allSources || !options.source ? {} : { source: options.source }),
+		...(allSources || !source ? {} : { source }),
+		...(scope === "user" || options.userOnly ? { userOnly: true } : {}),
 	});
+	let runs = scanned.runs;
+	if (options.relatedOnly || scope === "chat") runs = runs.filter((run) => runMatchesCurrentSession(run, options));
+	runs = sortRunsForView(runs, options.sortMode ?? "status", !!options.sortDesc);
+	return rebuildSummary(runs);
+}
+
+function runningCount(options: ViewOptions): number {
+	return summarize({ ...options, includeCompleted: false }).running.length;
+}
+
+function sessionScope(ctx?: ExtensionContext): Pick<ViewOptions, "parentSessionFile" | "parentSessionId" | "parentSessionName" | "cwd"> {
+	return {
+		...(ctx?.sessionManager.getSessionFile() ? { parentSessionFile: ctx.sessionManager.getSessionFile() } : {}),
+		...(ctx?.sessionManager.getSessionId() ? { parentSessionId: ctx.sessionManager.getSessionId() } : {}),
+		...(ctx?.sessionManager.getSessionName() ? { parentSessionName: ctx.sessionManager.getSessionName() } : {}),
+		...(ctx?.cwd ? { cwd: ctx.cwd } : {}),
+	};
+}
+
+function defaultOptions(ctx?: ExtensionContext): ViewOptions | undefined {
+	const scope = sessionScope(ctx);
+	return Object.keys(scope).length > 0 ? { scope: "chat", relatedOnly: true, ...scope } : undefined;
 }
 
 function render(ctx = latestCtx): void {
 	if (!ctx?.hasUI) return;
-	const source = configuredSource();
-	if (!source) {
+	const options = defaultOptions(ctx);
+	if (!options) {
 		ctx.ui.setStatus(EXTENSION_KEY, undefined);
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 		return;
 	}
-	const options: ViewOptions = { source, includeCompleted: false };
 	const summary = summarize(options);
 	ctx.ui.setStatus(EXTENSION_KEY, buildStatus(summary, options, ctx.ui.theme));
-	ctx.ui.setWidget(WIDGET_KEY, buildWidget(summary, options, ctx.ui.theme));
+	ctx.ui.setWidget(WIDGET_KEY, undefined);
 	ctx.ui.requestRender?.();
 }
 
@@ -197,9 +578,8 @@ function stopRefresh(ctx = latestCtx): void {
 	}
 }
 
-function notifyScoped(ctx: ExtensionContext, source: ForkSource, includeCompleted = false): void {
-	const options: ViewOptions = { source, includeCompleted };
-	ctx.ui.notify(formatCommandOutput(summarize(options), options, ctx.ui.theme), "info");
+async function notifyScoped(ctx: ExtensionContext, source: ForkSource, includeCompleted = false): Promise<void> {
+	await showForksModal(ctx, { source, includeCompleted });
 }
 
 export default function (pi: ExtensionAPI) {
@@ -215,19 +595,38 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("forks", {
-		description: "Show scoped background fork handlers. Use a source or --all-sources for global view.",
+		description: `Open compact fork handlers (${FORKS_SHORTCUT_LABEL}). Toggle related/completed/sort in the modal; use --all-sources for global view.`,
 		handler: async (args, ctx) => {
 			latestCtx = ctx;
 			const parsed = parseArgs(args);
-			const source = parsed.source ?? configuredSource();
-			if (!source && !parsed.allSources) {
-				ctx.ui.notify("Pick a fork source: /forks intercom, /forks return_on, /forks subagents. Use /forks --all-sources for the global view.", "info");
+			const fallback = defaultOptions(ctx);
+			const source = parsed.source ?? fallback?.source;
+			const scope = parsed.scope ?? (parsed.source ? undefined : parsed.allSources ? "all" : fallback?.scope ?? "chat");
+			const allSources = parsed.allSources || scope === "all" || (!source && !!fallback?.allSources);
+			await showForksModal(ctx, { source, scope, includeCompleted: parsed.includeCompleted, allSources, relatedOnly: parsed.relatedOnly ?? fallback?.relatedOnly ?? true, sortMode: parsed.sortMode, sortDesc: parsed.sortDesc, ...sessionScope(ctx) });
+		},
+	});
+
+	pi.registerShortcut?.(FORKS_SHORTCUT as never, {
+		description: "Open related fork handlers view",
+		handler: async (ctx) => {
+			const options = defaultOptions(ctx);
+			if (!options) {
+				ctx.ui.notify("No related fork source detected here. Use /forks intercom, /forks return_on, /forks subagents, or /forks --all-sources.", "info");
 				return;
 			}
-			const options: ViewOptions = { source, includeCompleted: parsed.includeCompleted, allSources: parsed.allSources };
-			const summary = summarize(options);
-			ctx.ui.notify(formatCommandOutput(summary, options, ctx.ui.theme), "info");
-			render(ctx);
+			await showForksModal(ctx, options);
+		},
+	});
+	pi.registerShortcut?.(FORKS_SHORTCUT_ALIAS as never, {
+		description: "Open related fork handlers view (alternate binding)",
+		handler: async (ctx) => {
+			const options = defaultOptions(ctx);
+			if (!options) {
+				ctx.ui.notify("No related fork source detected here. Use /forks intercom, /forks return_on, /forks subagents, or /forks --all-sources.", "info");
+				return;
+			}
+			await showForksModal(ctx, options);
 		},
 	});
 
