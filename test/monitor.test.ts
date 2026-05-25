@@ -113,6 +113,20 @@ test("scanForkRuns leaves running records without pid as running", () => {
 	assert.equal(summary.stale.length, 0);
 });
 
+test("diagnoseForkRuns labels legacy untracked subagent handler dirs", () => {
+	const home = makeHome();
+	const handlerDir = path.join(home, ".local/state/pi-subagents/handlers/sbf_legacy");
+	writeJson(path.join(handlerDir, "event.json"), { type: "async-complete", title: "old completion" });
+	fs.writeFileSync(path.join(handlerDir, "prompt.md"), "old prompt", "utf8");
+
+	const diagnostics = diagnoseForkRuns({ homeDir: home, now: 10_000 });
+	assert.equal(diagnostics.totals.unknown, 1);
+	const issue = diagnostics.issues.find((candidate) => candidate.kind === "unknown");
+	assert.match(issue?.message ?? "", /legacy untracked handler dir/);
+	assert.equal(issue?.detail, "legacy untracked handler dir (async-complete)");
+	assert.equal(diagnostics.summary.runs[0]?.detail, "legacy untracked handler dir (async-complete)");
+});
+
 test("diagnoseForkRuns reports stale records and duplicate active cwd groups", () => {
 	const home = makeHome();
 	const cwd = path.join(home, "repo");

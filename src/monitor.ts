@@ -424,7 +424,7 @@ function mapSubagentDir(dir: string, now: number): ForkRun | undefined {
 		...(parentSessionName ? { parentSessionName } : {}),
 		...(startedAt !== undefined ? { startedAt } : {}),
 		...(computeDuration(startedAt, undefined, now) !== undefined ? { durationMs: computeDuration(startedAt, undefined, now) } : {}),
-		...(eventType ? { detail: eventType } : {}),
+		detail: eventType ? `legacy untracked handler dir (${eventType})` : "legacy untracked handler dir",
 	};
 }
 
@@ -614,6 +614,7 @@ export function diagnoseForkRuns(options: ScanOptions = {}): ForkDiagnostics {
 	const summary = scanForkRuns({ ...options, includeCompleted: true });
 	const issues: ForkHealthIssue[] = [];
 	for (const run of summary.runs) {
+		const legacyUntracked = run.status === "unknown" && /^legacy untracked handler dir/.test(run.detail ?? "");
 		if (run.status === "stale" && run.pidAlive === false) {
 			addIssue(issues, {
 				kind: "stale_pid",
@@ -639,7 +640,10 @@ export function diagnoseForkRuns(options: ScanOptions = {}): ForkDiagnostics {
 				source: run.source,
 				runIds: [run.id],
 				cwd: run.cwd,
-				message: `${run.source}/${run.id} has legacy/unknown status`,
+				message: legacyUntracked
+					? `${run.source}/${run.id} is a legacy untracked handler dir without a shared handlers.json record`
+					: `${run.source}/${run.id} has legacy/unknown status`,
+				...(run.detail ? { detail: run.detail } : {}),
 			});
 		}
 		if (activeOrStale(run) && (run.tokens?.total ?? 0) >= 50_000) {

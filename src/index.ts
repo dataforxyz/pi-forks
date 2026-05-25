@@ -347,6 +347,7 @@ function formatRunLine(run: ForkRun, theme?: ThemeLike): string {
 		run.staleReason ? `stale=${run.staleReason}` : undefined,
 		run.intercomTarget ? `intercom=${run.intercomTarget}` : undefined,
 		run.parentIntercomTarget ? `parent=${run.parentIntercomTarget}` : undefined,
+		run.detail,
 		run.dir,
 	].filter(Boolean);
 	return details.join(theme ? theme.fg("dim", " | ") : " | ");

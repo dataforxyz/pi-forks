@@ -22,7 +22,7 @@ Currently it reads existing state from:
 - `~/.local/state/pi-subagents/handlers.json`
 - `~/.local/state/pi-subagents/handlers/` best-effort fallback for older handler dirs
 
-Running counts are authoritative when the source extension writes pid/status metadata. Older `pi-subagents` handler dirs without a shared record are shown as `unknown` only in `--all` views.
+Running counts are authoritative when the source extension writes pid/status metadata. Older `pi-subagents` handler dirs without a shared record are shown as `unknown` only in `--all` views and labeled as legacy untracked handler dirs so they are not confused with live fork state.
 
 By default the extension does **not** render a global all-source footer indicator. To opt into an automatic footer indicator for one source, set:
 
