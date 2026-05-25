@@ -12,6 +12,7 @@ It gives forks their own UI instead of burying fork telemetry inside `pi-interco
 - `Ctrl+Alt+F` or `/forks` opens the current chat by default. The modal has toggles for `t` related-only, `c` completed, `s` sort mode, and `v` reverse sort; press `a` to cycle scopes: this chat, response handlers, subagents, user forks, all forks. Close with `Esc` or `q`.
 - `/forks <source> --all` to include completed, failed, and unknown handlers for that source.
 - `/forks --all-sources` for the intentional global view.
+- `/forks --health` or `/forks-health` for a text diagnostic report covering stale dead-PID records, failed/unknown handlers, duplicate active handlers in the same cwd, and token totals.
 
 Currently it reads existing state from:
 
@@ -75,6 +76,8 @@ Ctrl+Alt+F              open compact fork handlers modal
 /forks return_on --all   include completed/failed/unknown for that source
 /forks --all-sources     intentional global active/stale view
 /forks --all-sources -a  intentional global view including completed records
+/forks --health          diagnose stale/duplicate/failed fork records
+/forks-health            shorthand health report across all sources
 
 /intercom-forks          shorthand for /forks intercom
 /return-on-forks         shorthand for /forks return_on

@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { scanForkRuns, type ForkRun, type ForkSource, type ForkSummary } from "./monitor.ts";
+import { diagnoseForkRuns, scanForkRuns, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary } from "./monitor.ts";
 
 const EXTENSION_KEY = "pi-forks";
 const WIDGET_KEY = "pi-forks";
@@ -35,6 +35,7 @@ interface ViewOptions {
 	relatedOnly?: boolean;
 	sortMode?: SortMode;
 	sortDesc?: boolean;
+	diagnose?: boolean;
 }
 
 let latestCtx: ExtensionContext | undefined;
@@ -81,7 +82,8 @@ function parseArgs(args: string): ViewOptions {
 	const scope = words.map(parseScope).find((value): value is ViewScope => !!value);
 	const sortMode = words.map(parseSortMode).find((value): value is SortMode => !!value);
 	const sortDesc = words.some((word) => word === "--desc" || word === "--reverse");
-	return { source, includeCompleted, allSources, sortDesc, ...(relatedFlag || unrelatedFlag ? { relatedOnly: relatedFlag && !unrelatedFlag } : {}), ...(scope ? { scope } : {}), ...(sortMode ? { sortMode } : {}) };
+	const diagnose = words.some((word) => word === "--diagnose" || word === "--health");
+	return { source, includeCompleted, allSources, sortDesc, diagnose, ...(relatedFlag || unrelatedFlag ? { relatedOnly: relatedFlag && !unrelatedFlag } : {}), ...(scope ? { scope } : {}), ...(sortMode ? { sortMode } : {}) };
 }
 
 function formatDuration(ms: number | undefined): string {
@@ -177,6 +179,7 @@ function compactRunStats(run: ForkRun): string {
 	const parts: string[] = [run.status];
 	if (run.durationMs !== undefined) parts.push(formatDuration(run.durationMs));
 	if (run.tokens?.total) parts.push(`${formatTokens(run.tokens.total)} tok`);
+	if (run.status === "stale" && run.pidAlive === false) parts.push("pid dead");
 	return parts.join(" · ");
 }
 
@@ -200,6 +203,9 @@ function runMatchesCurrentSession(run: ForkRun, options: ViewOptions): boolean {
 
 function rebuildSummary(runs: ForkRun[]): ForkSummary {
 	const running = runs.filter((run) => run.status === "running" || run.status === "starting");
+	const stale = runs.filter((run) => run.status === "stale");
+	const countsByStatus: ForkSummary["countsByStatus"] = { starting: 0, running: 0, complete: 0, failed: 0, stale: 0, unknown: 0 };
+	for (const run of runs) countsByStatus[run.status] += 1;
 	const totalTokens = runs.reduce((acc, run) => {
 		acc.input += run.tokens?.input ?? 0;
 		acc.output += run.tokens?.output ?? 0;
@@ -207,7 +213,7 @@ function rebuildSummary(runs: ForkRun[]): ForkSummary {
 		return acc;
 	}, { input: 0, output: 0, total: 0 });
 	const maxRunningDurationMs = running.reduce((max, run) => Math.max(max, run.durationMs ?? 0), 0);
-	return { runs, running, totalTokens, maxRunningDurationMs };
+	return { runs, running, stale, countsByStatus, totalTokens, maxRunningDurationMs };
 }
 
 function sortValue(run: ForkRun, mode: SortMode): string | number {
@@ -232,23 +238,29 @@ function sortRunsForView(runs: ForkRun[], mode: SortMode, reverse: boolean): For
 }
 
 function buildStatus(summary: ForkSummary, _options: ViewOptions, theme?: ThemeLike): string | undefined {
-	if (summary.running.length === 0) return undefined;
-	const globalRunning = summarize({ allSources: true }).running.length;
-	const iconText = forkIcon(Math.max(summary.running.length, globalRunning));
-	const icon = theme ? theme.fg("success", iconText) : iconText;
-	const countText = globalRunning > summary.running.length ? `${summary.running.length}/${globalRunning}` : String(summary.running.length);
-	const count = theme ? theme.fg("success", countText) : countText;
+	if (summary.running.length === 0 && summary.stale.length === 0) return undefined;
+	const global = summarize({ allSources: true });
+	const globalRunning = global.running.length;
+	const globalStale = global.stale.length;
+	const activeCount = Math.max(summary.running.length + summary.stale.length, globalRunning + globalStale);
+	const iconText = forkIcon(activeCount);
+	const color = summary.running.length > 0 || globalRunning > 0 ? "success" : "warning";
+	const icon = theme ? theme.fg(color, iconText) : iconText;
+	const countText = globalRunning > summary.running.length || globalStale > summary.stale.length
+		? `${summary.running.length}/${globalRunning} running · ${summary.stale.length}/${globalStale} stale`
+		: `${summary.running.length} running · ${summary.stale.length} stale`;
+	const count = theme ? theme.fg(color, countText) : countText;
 	const hint = theme ? theme.fg("dim", FORKS_SHORTCUT_LABEL) : FORKS_SHORTCUT_LABEL;
 	return `${icon} ${count} · ${hint}`;
 }
 
 function buildWidget(summary: ForkSummary, options: ViewOptions, theme?: ThemeLike): string[] | undefined {
 	if (summary.runs.length === 0) return undefined;
-	const active = summary.running.length > 0;
+	const active = summary.running.length > 0 || summary.stale.length > 0;
 	const title = sourceTitle(options.source, !!options.allSources);
 	const lines: string[] = [];
 	lines.push(theme ? theme.fg(active ? "accent" : "muted", `╭─ ${title}`) : `╭─ ${title}`);
-	const meta = `${summary.running.length} running · ${summary.runs.length} tracked · ${formatTokens(summary.totalTokens.total)} tok`;
+	const meta = `${summary.running.length} running · ${summary.stale.length} stale · ${summary.runs.length} tracked · ${formatTokens(summary.totalTokens.total)} tok`;
 	lines.push(theme ? theme.fg("dim", `│  ${meta}`) : `│  ${meta}`);
 	for (const run of summary.runs.slice(0, WIDGET_LIMIT)) {
 		const glyph = theme ? theme.fg(statusColor(run.status), statusGlyph(run.status)) : statusGlyph(run.status);
@@ -277,6 +289,8 @@ function formatRunLine(run: ForkRun, theme?: ThemeLike): string {
 		run.durationMs !== undefined ? formatDuration(run.durationMs) : undefined,
 		run.tokens?.total ? `${formatTokens(run.tokens.total)} tok` : undefined,
 		run.pid ? `pid=${run.pid}${run.pidAlive === false ? "(dead)" : ""}` : undefined,
+		run.rawStatus ? `raw=${run.rawStatus}` : undefined,
+		run.staleReason ? `stale=${run.staleReason}` : undefined,
 		run.intercomTarget ? `intercom=${run.intercomTarget}` : undefined,
 		run.parentIntercomTarget ? `parent=${run.parentIntercomTarget}` : undefined,
 		run.dir,
@@ -288,8 +302,28 @@ function formatCommandOutput(summary: ForkSummary, options: ViewOptions, theme?:
 	const titleText = scopeLabel(options);
 	if (summary.runs.length === 0) return `No ${titleText.toLowerCase()} found.`;
 	const title = theme ? theme.fg("accent", theme.bold(titleText)) : titleText;
-	const header = `${title}: ${summary.running.length} running, ${summary.runs.length} tracked, ${formatTokens(summary.totalTokens.total)} tokens`;
+	const header = `${title}: ${summary.running.length} running, ${summary.stale.length} stale, ${summary.runs.length} tracked, ${formatTokens(summary.totalTokens.total)} tokens`;
 	return [header, "", ...summary.runs.map((run) => formatRunLine(run, theme))].join("\n");
+}
+
+function formatDiagnostics(diagnostics: ForkDiagnostics, options: ViewOptions, theme?: ThemeLike): string {
+	const titleText = `${scopeLabel(options)} health`;
+	const title = theme ? theme.fg("accent", theme.bold(titleText)) : titleText;
+	const totals = diagnostics.totals;
+	const header = `${title}: ${totals.tracked} tracked · ${totals.running} running · ${totals.stale} stale · ${totals.failed} failed · ${formatTokens(totals.totalTokens)} tokens`;
+	const lines = [header, `dead-pid active records: ${totals.deadPidRunningRecords}`];
+	if (diagnostics.issues.length === 0) {
+		lines.push("No health issues found.");
+		return lines.join("\n");
+	}
+	lines.push("", "Issues:");
+	for (const issue of diagnostics.issues) {
+		const severity = theme ? theme.fg(issue.severity === "error" ? "error" : issue.severity === "warning" ? "warning" : "muted", issue.severity) : issue.severity;
+		lines.push(`- [${severity}] ${issue.kind}: ${issue.message}`);
+		if (issue.detail) lines.push(`  ${issue.detail}`);
+		if (issue.runIds.length > 1) lines.push(`  runs: ${issue.runIds.join(", ")}`);
+	}
+	return lines.join("\n");
 }
 
 function matchesInput(data: string, key: string): boolean {
@@ -603,7 +637,12 @@ export default function (pi: ExtensionAPI) {
 			const source = parsed.source ?? fallback?.source;
 			const scope = parsed.scope ?? (parsed.source ? undefined : parsed.allSources ? "all" : fallback?.scope ?? "chat");
 			const allSources = parsed.allSources || scope === "all" || (!source && !!fallback?.allSources);
-			await showForksModal(ctx, { source, scope, includeCompleted: parsed.includeCompleted, allSources, relatedOnly: parsed.relatedOnly ?? fallback?.relatedOnly ?? true, sortMode: parsed.sortMode, sortDesc: parsed.sortDesc, ...sessionScope(ctx) });
+			const options = { source, scope, includeCompleted: parsed.includeCompleted, allSources, relatedOnly: parsed.relatedOnly ?? fallback?.relatedOnly ?? true, sortMode: parsed.sortMode, sortDesc: parsed.sortDesc, ...sessionScope(ctx) } satisfies ViewOptions;
+			if (parsed.diagnose) {
+				ctx.ui.notify(formatDiagnostics(diagnoseForkRuns({ includeCompleted: true, ...(allSources || !source ? {} : { source }) }), { ...options, includeCompleted: true, allSources: allSources || !source }, ctx.ui.theme), "info");
+				return;
+			}
+			await showForksModal(ctx, options);
 		},
 	});
 
@@ -627,6 +666,16 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			await showForksModal(ctx, options);
+		},
+	});
+
+	pi.registerCommand("forks-health", {
+		description: "Report stale fork records, duplicate active cwd groups, failures, and token totals.",
+		handler: async (args, ctx) => {
+			const parsed = parseArgs(args);
+			const source = parsed.source;
+			const allSources = parsed.allSources || !source;
+			ctx.ui.notify(formatDiagnostics(diagnoseForkRuns({ includeCompleted: true, ...(allSources ? {} : { source }) }), { source, includeCompleted: true, allSources }, ctx.ui.theme), "info");
 		},
 	});
 

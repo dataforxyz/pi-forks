@@ -16,6 +16,8 @@ export interface ForkRun {
 	id: string;
 	label: string;
 	status: ForkStatus;
+	rawStatus?: ForkStatus;
+	staleReason?: string;
 	pid?: number;
 	pidAlive?: boolean;
 	cwd?: string;
@@ -37,8 +39,38 @@ export interface ForkRun {
 export interface ForkSummary {
 	runs: ForkRun[];
 	running: ForkRun[];
+	stale: ForkRun[];
+	countsByStatus: Record<ForkStatus, number>;
 	totalTokens: TokenUsage;
 	maxRunningDurationMs: number;
+}
+
+export type ForkHealthSeverity = "info" | "warning" | "error";
+export type ForkHealthIssueKind = "stale_pid" | "failed" | "unknown" | "duplicate_active_cwd" | "high_cost_incomplete";
+
+export interface ForkHealthIssue {
+	kind: ForkHealthIssueKind;
+	severity: ForkHealthSeverity;
+	message: string;
+	runIds: string[];
+	source?: ForkSource;
+	cwd?: string;
+	detail?: string;
+}
+
+export interface ForkDiagnostics {
+	summary: ForkSummary;
+	issues: ForkHealthIssue[];
+	totals: {
+		tracked: number;
+		running: number;
+		stale: number;
+		failed: number;
+		complete: number;
+		unknown: number;
+		deadPidRunningRecords: number;
+		totalTokens: number;
+	};
 }
 
 export interface ScanOptions {
@@ -98,6 +130,11 @@ function intercomMetadata(source: ForkSource, id: string): Pick<ForkRun, "interc
 function effectiveStatus(status: ForkStatus, pidAlive: boolean | undefined): ForkStatus {
 	if ((status === "starting" || status === "running") && pidAlive === false) return "stale";
 	return status;
+}
+
+function staleReason(rawStatus: ForkStatus, pid: number | undefined, pidAlive: boolean | undefined): string | undefined {
+	if ((rawStatus === "starting" || rawStatus === "running") && pidAlive === false) return `pid ${pid ?? "unknown"} is not alive while raw status is ${rawStatus}`;
+	return undefined;
 }
 
 function computeDuration(startedAt: number | undefined, endedAt: number | undefined, now: number): number | undefined {
@@ -163,7 +200,9 @@ function mapIntercomRun(run: Record<string, unknown>, now: number): ForkRun | un
 	const endedAt = numberValue(run.endedAt);
 	const pid = numberValue(run.pid);
 	const pidAlive = isProcessAlive(pid);
-	const status = effectiveStatus(statusValue(run.status), pidAlive);
+	const rawStatus = statusValue(run.status);
+	const status = effectiveStatus(rawStatus, pidAlive);
+	const reason = staleReason(rawStatus, pid, pidAlive);
 	const from = stringValue(run.from);
 	const messageId = stringValue(run.messageId);
 	const sessionDir = stringValue(run.sessionDir);
@@ -176,6 +215,8 @@ function mapIntercomRun(run: Record<string, unknown>, now: number): ForkRun | un
 		id,
 		label: from ? `from ${from}` : id,
 		status,
+		...(rawStatus !== status ? { rawStatus } : {}),
+		...(reason ? { staleReason: reason } : {}),
 		...intercomMetadata("intercom", id),
 		...(pid !== undefined ? { pid } : {}),
 		...(pidAlive !== undefined ? { pidAlive } : {}),
@@ -200,7 +241,9 @@ function mapReturnOnRun(run: Record<string, unknown>, now: number): ForkRun | un
 	const endedAt = numberValue(run.endedAt);
 	const pid = numberValue(run.pid);
 	const pidAlive = isProcessAlive(pid);
-	const status = effectiveStatus(statusValue(run.status), pidAlive);
+	const rawStatus = statusValue(run.status);
+	const status = effectiveStatus(rawStatus, pidAlive);
+	const reason = staleReason(rawStatus, pid, pidAlive);
 	const sessionDir = stringValue(run.sessionDir);
 	const label = stringValue(run.label) ?? stringValue(run.jobId) ?? id;
 	const parentIntercomTarget = stringValue(run.parentIntercomTarget) ?? stringValue(run.parentSessionName);
@@ -212,6 +255,8 @@ function mapReturnOnRun(run: Record<string, unknown>, now: number): ForkRun | un
 		id,
 		label,
 		status,
+		...(rawStatus !== status ? { rawStatus } : {}),
+		...(reason ? { staleReason: reason } : {}),
 		...intercomMetadata("return_on", id),
 		...(pid !== undefined ? { pid } : {}),
 		...(pidAlive !== undefined ? { pidAlive } : {}),
@@ -236,7 +281,9 @@ function mapSubagentRun(run: Record<string, unknown>, now: number): ForkRun | un
 	const endedAt = numberValue(run.endedAt);
 	const pid = numberValue(run.pid);
 	const pidAlive = isProcessAlive(pid);
-	const status = effectiveStatus(statusValue(run.status), pidAlive);
+	const rawStatus = statusValue(run.status);
+	const status = effectiveStatus(rawStatus, pidAlive);
+	const reason = staleReason(rawStatus, pid, pidAlive);
 	const sessionDir = stringValue(run.sessionDir);
 	const title = stringValue(run.title) ?? id;
 	const parentIntercomTarget = stringValue(run.parentIntercomTarget) ?? stringValue(run.parentSessionName);
@@ -248,6 +295,8 @@ function mapSubagentRun(run: Record<string, unknown>, now: number): ForkRun | un
 		id,
 		label: title,
 		status,
+		...(rawStatus !== status ? { rawStatus } : {}),
+		...(reason ? { staleReason: reason } : {}),
 		...intercomMetadata("subagents", id),
 		...(pid !== undefined ? { pid } : {}),
 		...(pidAlive !== undefined ? { pidAlive } : {}),
@@ -364,6 +413,9 @@ export function scanForkRuns(options: ScanOptions = {}): ForkSummary {
 		if (tokens) run.tokens = tokens;
 	}
 	const running = limited.filter((run) => run.status === "running" || run.status === "starting");
+	const stale = limited.filter((run) => run.status === "stale");
+	const countsByStatus: Record<ForkStatus, number> = { starting: 0, running: 0, complete: 0, failed: 0, stale: 0, unknown: 0 };
+	for (const run of limited) countsByStatus[run.status] += 1;
 	const totalTokens = limited.reduce<TokenUsage>((acc, run) => {
 		acc.input += run.tokens?.input ?? 0;
 		acc.output += run.tokens?.output ?? 0;
@@ -371,5 +423,90 @@ export function scanForkRuns(options: ScanOptions = {}): ForkSummary {
 		return acc;
 	}, { input: 0, output: 0, total: 0 });
 	const maxRunningDurationMs = running.reduce((max, run) => Math.max(max, run.durationMs ?? 0), 0);
-	return { runs: limited, running, totalTokens, maxRunningDurationMs };
+	return { runs: limited, running, stale, countsByStatus, totalTokens, maxRunningDurationMs };
+}
+
+function activeOrStale(run: ForkRun): boolean {
+	return run.status === "running" || run.status === "starting" || run.status === "stale";
+}
+
+function addIssue(issues: ForkHealthIssue[], issue: ForkHealthIssue): void {
+	issues.push(issue);
+}
+
+export function diagnoseForkRuns(options: ScanOptions = {}): ForkDiagnostics {
+	const summary = scanForkRuns({ ...options, includeCompleted: true });
+	const issues: ForkHealthIssue[] = [];
+	for (const run of summary.runs) {
+		if (run.status === "stale" && run.pidAlive === false) {
+			addIssue(issues, {
+				kind: "stale_pid",
+				severity: "warning",
+				source: run.source,
+				runIds: [run.id],
+				cwd: run.cwd,
+				message: `${run.source}/${run.id} is stale: ${run.staleReason ?? `pid ${run.pid ?? "unknown"} is dead`}`,
+			});
+		} else if (run.status === "failed") {
+			addIssue(issues, {
+				kind: "failed",
+				severity: "error",
+				source: run.source,
+				runIds: [run.id],
+				cwd: run.cwd,
+				message: `${run.source}/${run.id} failed: ${run.label}`,
+			});
+		} else if (run.status === "unknown") {
+			addIssue(issues, {
+				kind: "unknown",
+				severity: "info",
+				source: run.source,
+				runIds: [run.id],
+				cwd: run.cwd,
+				message: `${run.source}/${run.id} has legacy/unknown status`,
+			});
+		}
+		if (activeOrStale(run) && (run.tokens?.total ?? 0) >= 50_000) {
+			addIssue(issues, {
+				kind: "high_cost_incomplete",
+				severity: "warning",
+				source: run.source,
+				runIds: [run.id],
+				cwd: run.cwd,
+				message: `${run.source}/${run.id} is ${run.status} after ${run.tokens?.total ?? 0} tokens`,
+			});
+		}
+	}
+
+	const byCwd = new Map<string, ForkRun[]>();
+	for (const run of summary.runs.filter((run) => activeOrStale(run) && !!run.cwd)) {
+		const cwd = run.cwd as string;
+		byCwd.set(cwd, [...(byCwd.get(cwd) ?? []), run]);
+	}
+	for (const [cwd, runs] of byCwd) {
+		if (runs.length <= 1) continue;
+		addIssue(issues, {
+			kind: "duplicate_active_cwd",
+			severity: runs.some((run) => run.status === "running" || run.status === "starting") ? "error" : "warning",
+			runIds: runs.map((run) => run.id),
+			cwd,
+			message: `${runs.length} active/stale fork handlers share cwd ${cwd}`,
+			detail: runs.map((run) => `${run.source}/${run.id}:${run.status}`).join(", "),
+		});
+	}
+
+	return {
+		summary,
+		issues,
+		totals: {
+			tracked: summary.runs.length,
+			running: summary.running.length,
+			stale: summary.stale.length,
+			failed: summary.countsByStatus.failed,
+			complete: summary.countsByStatus.complete,
+			unknown: summary.countsByStatus.unknown,
+			deadPidRunningRecords: summary.runs.filter((run) => run.pidAlive === false && (run.rawStatus === "running" || run.rawStatus === "starting")).length,
+			totalTokens: summary.totalTokens.total,
+		},
+	};
 }

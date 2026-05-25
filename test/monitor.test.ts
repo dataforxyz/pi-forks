@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { parseSessionTokens, scanForkRuns } from "../src/monitor.ts";
+import { diagnoseForkRuns, parseSessionTokens, scanForkRuns } from "../src/monitor.ts";
 
 function makeHome(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-forks-test-"));
@@ -51,7 +51,9 @@ test("scanForkRuns reports running count, durations, and token totals", () => {
 
 	const active = scanForkRuns({ homeDir: home, now });
 	assert.equal(active.running.length, 2);
+	assert.equal(active.stale.length, 0);
 	assert.equal(active.runs.length, 2);
+	assert.equal(active.countsByStatus.running, 2);
 	assert.equal(active.maxRunningDurationMs, 9_000);
 	assert.equal(active.totalTokens.total, 330);
 
@@ -65,4 +67,53 @@ test("scanForkRuns reports running count, durations, and token totals", () => {
 	assert.equal(scoped.runs[0]?.intercomTarget, "fork-return-on-1");
 	assert.equal(scoped.runs[0]?.intercomStatusTag, "fork-handler:return-on:roh_1");
 	assert.equal(scoped.totalTokens.total, 165);
+});
+
+test("scanForkRuns marks dead running pids as stale and preserves raw status", () => {
+	const home = makeHome();
+	writeJson(path.join(home, ".local/state/pi-intercom/handlers.json"), {
+		runs: [{ id: "icfh_dead", from: "other", status: "running", startedAt: 1_000, pid: 9_999_999 }],
+	});
+
+	const summary = scanForkRuns({ homeDir: home, now: 10_000 });
+	assert.equal(summary.runs.length, 1);
+	assert.equal(summary.runs[0]?.status, "stale");
+	assert.equal(summary.runs[0]?.rawStatus, "running");
+	assert.match(summary.runs[0]?.staleReason ?? "", /pid 9999999 is not alive/);
+	assert.equal(summary.running.length, 0);
+	assert.equal(summary.stale.length, 1);
+	assert.equal(summary.countsByStatus.stale, 1);
+});
+
+test("scanForkRuns leaves running records without pid as running", () => {
+	const home = makeHome();
+	writeJson(path.join(home, ".local/state/pi-intercom/handlers.json"), {
+		runs: [{ id: "icfh_missing_pid", from: "other", status: "running", startedAt: 1_000 }],
+	});
+
+	const summary = scanForkRuns({ homeDir: home, now: 10_000 });
+	assert.equal(summary.runs.length, 1);
+	assert.equal(summary.runs[0]?.status, "running");
+	assert.equal(summary.runs[0]?.pidAlive, undefined);
+	assert.equal(summary.runs[0]?.staleReason, undefined);
+	assert.equal(summary.running.length, 1);
+	assert.equal(summary.stale.length, 0);
+});
+
+test("diagnoseForkRuns reports stale records and duplicate active cwd groups", () => {
+	const home = makeHome();
+	const cwd = path.join(home, "repo");
+	writeJson(path.join(home, ".local/state/pi-intercom/handlers.json"), {
+		runs: [
+			{ id: "icfh_dead", from: "other", status: "running", startedAt: 1_000, pid: 9_999_999, cwd },
+			{ id: "icfh_live", from: "other", status: "running", startedAt: 2_000, pid: process.pid, cwd },
+		],
+	});
+
+	const diagnostics = diagnoseForkRuns({ homeDir: home, now: 10_000 });
+	assert.equal(diagnostics.totals.deadPidRunningRecords, 1);
+	assert.equal(diagnostics.totals.stale, 1);
+	assert.equal(diagnostics.totals.running, 1);
+	assert.ok(diagnostics.issues.some((issue) => issue.kind === "stale_pid" && issue.runIds.includes("icfh_dead")));
+	assert.ok(diagnostics.issues.some((issue) => issue.kind === "duplicate_active_cwd" && issue.cwd === cwd));
 });
