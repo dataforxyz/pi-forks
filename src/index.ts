@@ -293,7 +293,7 @@ function buildStatus(summary: ForkSummary, _options: ViewOptions, theme?: ThemeL
 function buildSpendStatus(threadTokens: TokenUsage | undefined, agentSpend: AgentSpendSummary, forkSummary: ForkSummary): string | undefined {
 	const parts: string[] = [];
 	const thread = formatSpend(threadTokens);
-	if (thread) parts.push(cyan(`◉ thread ${thread}`));
+	if (thread) parts.push(cyan(`◉ dialog ${thread}`));
 	const agents = formatSpend(agentSpend.totalTokens, agentSpend.totalCost);
 	if (agents) {
 		const active = agentSpend.active.length > 0 ? ` (${agentSpend.active.length} active)` : "";
@@ -672,8 +672,8 @@ function formatSpendLine(label: string, tokens: TokenUsage | undefined, extra?: 
 
 function formatSpendReport(options: ViewOptions): string {
 	const spend = currentSpend(options);
-	const lines = ["Pi spend for this thread"];
-	lines.push(formatSpendLine("thread", spend.threadTokens));
+	const lines = ["Pi spend for this dialog"];
+	lines.push(formatSpendLine("dialog", spend.threadTokens));
 	lines.push(formatSpendLine("agents", spend.agentSpend.totalTokens, `${spend.agentSpend.runs.length} runs · ${spend.agentSpend.steps} steps${spend.agentSpend.active.length ? ` · ${spend.agentSpend.active.length} active` : ""}`));
 	lines.push(formatSpendLine("forks", spend.forkSummary.totalTokens, `${spend.forkSummary.runs.length} related runs${spend.forkSummary.running.length || spend.forkSummary.stale.length ? ` · ${spend.forkSummary.running.length} running · ${spend.forkSummary.stale.length} stale` : ""}`));
 	return lines.join("\n");
@@ -784,7 +784,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("pi-spend", {
-		description: "Show this thread's token/cost split across thread, agents, and fork handlers.",
+		description: "Show this dialog's token/cost split across dialog, agents, and fork handlers.",
 		handler: async (_args, ctx) => {
 			const options = defaultOptions(ctx) ?? { scope: "chat", relatedOnly: true, ...sessionScope(ctx) };
 			ctx.ui.notify(formatSpendReport(options), "info");
