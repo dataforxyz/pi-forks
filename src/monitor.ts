@@ -9,6 +9,7 @@ export interface TokenUsage {
 	input: number;
 	output: number;
 	total: number;
+	cost?: number;
 }
 
 const sessionTokenCache = new Map<string, { mtimeMs: number; size: number; tokens?: TokenUsage }>();
@@ -87,6 +88,31 @@ export interface ScanOptions {
 	userOnly?: boolean;
 }
 
+export interface AgentSpendRun {
+	id: string;
+	state?: string;
+	steps: number;
+	active: boolean;
+	tokens: TokenUsage;
+	cost?: number;
+	cwd?: string;
+	startedAt?: number;
+	endedAt?: number;
+}
+
+export interface AgentSpendSummary {
+	runs: AgentSpendRun[];
+	active: AgentSpendRun[];
+	steps: number;
+	totalTokens: TokenUsage;
+	totalCost?: number;
+}
+
+export interface AgentSpendOptions {
+	parentSessionFile?: string;
+	rootDir?: string;
+}
+
 interface IntercomHandlersState {
 	runs?: Array<Record<string, unknown>>;
 }
@@ -157,15 +183,25 @@ function findLatestSessionFile(sessionDir: string): string | undefined {
 	}
 }
 
-function usageNumbers(usage: Record<string, unknown>): Pick<TokenUsage, "input" | "output"> {
-	const input = numberValue(usage.inputTokens) ?? numberValue(usage.input) ?? 0;
-	const output = numberValue(usage.outputTokens) ?? numberValue(usage.output) ?? 0;
-	return { input, output };
+function costValue(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (typeof value === "object" && value !== null) {
+		const record = value as Record<string, unknown>;
+		return numberValue(record.total) ?? [record.input, record.output, record.cacheRead, record.cacheWrite]
+			.map(numberValue)
+			.reduce<number>((sum, item) => sum + (item ?? 0), 0);
+	}
+	return undefined;
 }
 
-export function parseSessionTokens(sessionDir: string | undefined): TokenUsage | undefined {
-	if (!sessionDir) return undefined;
-	const sessionFile = findLatestSessionFile(sessionDir);
+function usageNumbers(usage: Record<string, unknown>): Pick<TokenUsage, "input" | "output" | "cost"> {
+	const input = numberValue(usage.inputTokens) ?? numberValue(usage.input) ?? 0;
+	const output = numberValue(usage.outputTokens) ?? numberValue(usage.output) ?? 0;
+	const cost = costValue(usage.cost);
+	return { input, output, ...(cost !== undefined ? { cost } : {}) };
+}
+
+export function parseSessionTokenFile(sessionFile: string | undefined): TokenUsage | undefined {
 	if (!sessionFile) return undefined;
 	let stat: fs.Stats;
 	try {
@@ -177,6 +213,7 @@ export function parseSessionTokens(sessionDir: string | undefined): TokenUsage |
 	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.tokens ? { ...cached.tokens } : undefined;
 	let input = 0;
 	let output = 0;
+	let cost = 0;
 	try {
 		const content = fs.readFileSync(sessionFile, "utf8");
 		for (const line of content.split("\n")) {
@@ -192,6 +229,7 @@ export function parseSessionTokens(sessionDir: string | undefined): TokenUsage |
 				const values = usageNumbers(usage);
 				input += values.input;
 				output += values.output;
+				cost += values.cost ?? 0;
 			} catch {
 				// Ignore malformed jsonl entries while collecting telemetry.
 			}
@@ -200,9 +238,14 @@ export function parseSessionTokens(sessionDir: string | undefined): TokenUsage |
 		return undefined;
 	}
 	const total = input + output;
-	const tokens = total > 0 ? { input, output, total } : undefined;
+	const tokens = total > 0 ? { input, output, total, ...(cost > 0 ? { cost } : {}) } : undefined;
 	sessionTokenCache.set(sessionFile, { mtimeMs: stat.mtimeMs, size: stat.size, tokens });
 	return tokens ? { ...tokens } : undefined;
+}
+
+export function parseSessionTokens(sessionDir: string | undefined): TokenUsage | undefined {
+	if (!sessionDir) return undefined;
+	return parseSessionTokenFile(findLatestSessionFile(sessionDir));
 }
 
 function mapIntercomRun(run: Record<string, unknown>, now: number): ForkRun | undefined {
@@ -432,10 +475,110 @@ export function scanForkRuns(options: ScanOptions = {}): ForkSummary {
 		acc.input += run.tokens?.input ?? 0;
 		acc.output += run.tokens?.output ?? 0;
 		acc.total += run.tokens?.total ?? 0;
+		acc.cost = (acc.cost ?? 0) + (run.tokens?.cost ?? 0);
 		return acc;
-	}, { input: 0, output: 0, total: 0 });
+	}, { input: 0, output: 0, total: 0, cost: 0 });
+	if (!totalTokens.cost) delete totalTokens.cost;
 	const maxRunningDurationMs = running.reduce((max, run) => Math.max(max, run.durationMs ?? 0), 0);
 	return { runs: limited, running, stale, countsByStatus, totalTokens, maxRunningDurationMs };
+}
+
+function defaultAgentRoot(): string {
+	const uid = typeof process.getuid === "function" ? process.getuid() : process.env.UID ?? "unknown";
+	return path.join(os.tmpdir(), `pi-subagents-uid-${uid}`, "async-subagent-runs");
+}
+
+function addTokenUsage(acc: TokenUsage, tokens: TokenUsage | undefined): void {
+	if (!tokens) return;
+	acc.input += tokens.input;
+	acc.output += tokens.output;
+	acc.total += tokens.total;
+	acc.cost = (acc.cost ?? 0) + (tokens.cost ?? 0);
+}
+
+function tokensFromAttempts(attempts: unknown): TokenUsage {
+	const tokens: TokenUsage = { input: 0, output: 0, total: 0, cost: 0 };
+	if (!Array.isArray(attempts)) return tokens;
+	for (const attempt of attempts) {
+		if (typeof attempt !== "object" || attempt === null) continue;
+		const usage = (attempt as Record<string, unknown>).usage;
+		if (typeof usage !== "object" || usage === null) continue;
+		const values = usageNumbers(usage as Record<string, unknown>);
+		tokens.input += values.input;
+		tokens.output += values.output;
+		tokens.total += values.input + values.output;
+		tokens.cost = (tokens.cost ?? 0) + (values.cost ?? 0);
+	}
+	if (!tokens.cost) delete tokens.cost;
+	return tokens;
+}
+
+function stepTokens(step: Record<string, unknown>): TokenUsage {
+	const rawTokens = step.tokens;
+	if (typeof rawTokens === "object" && rawTokens !== null) {
+		const tokenRecord = rawTokens as Record<string, unknown>;
+		const input = numberValue(tokenRecord.input) ?? 0;
+		const output = numberValue(tokenRecord.output) ?? 0;
+		const total = numberValue(tokenRecord.total) ?? input + output;
+		let cost = numberValue(tokenRecord.cost);
+		if (cost === undefined) {
+			for (const attempt of Array.isArray(step.modelAttempts) ? step.modelAttempts : []) {
+				if (typeof attempt !== "object" || attempt === null) continue;
+				const usage = (attempt as Record<string, unknown>).usage;
+				if (typeof usage === "object" && usage !== null) cost = (cost ?? 0) + (costValue((usage as Record<string, unknown>).cost) ?? 0);
+			}
+		}
+		return { input, output, total, ...(cost ? { cost } : {}) };
+	}
+	return tokensFromAttempts(step.modelAttempts);
+}
+
+export function scanAgentSpend(options: AgentSpendOptions = {}): AgentSpendSummary {
+	const parentSessionFile = options.parentSessionFile;
+	const rootDir = options.rootDir ?? defaultAgentRoot();
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(rootDir, { withFileTypes: true });
+	} catch {
+		return { runs: [], active: [], steps: 0, totalTokens: { input: 0, output: 0, total: 0 } };
+	}
+	const runs: AgentSpendRun[] = [];
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		const status = readJsonFile<Record<string, unknown>>(path.join(rootDir, entry.name, "status.json"));
+		if (!status) continue;
+		if (parentSessionFile && stringValue(status.sessionId) !== parentSessionFile) continue;
+		const steps = Array.isArray(status.steps) ? status.steps.filter((step) => typeof step === "object" && step !== null) as Array<Record<string, unknown>> : [];
+		const tokens: TokenUsage = { input: 0, output: 0, total: 0, cost: 0 };
+		for (const step of steps) addTokenUsage(tokens, stepTokens(step));
+		if (!tokens.cost) delete tokens.cost;
+		const state = stringValue(status.state);
+		const active = state === "running" || state === "starting" || state === "paused";
+		runs.push({
+			id: stringValue(status.runId) ?? entry.name,
+			...(state ? { state } : {}),
+			steps: steps.length,
+			active,
+			tokens,
+			...(tokens.cost ? { cost: tokens.cost } : {}),
+			...(stringValue(status.cwd) ? { cwd: stringValue(status.cwd) } : {}),
+			...(numberValue(status.startedAt) ? { startedAt: numberValue(status.startedAt) } : {}),
+			...(numberValue(status.endedAt) ? { endedAt: numberValue(status.endedAt) } : {}),
+		});
+	}
+	const totalTokens = runs.reduce<TokenUsage>((acc, run) => {
+		addTokenUsage(acc, run.tokens);
+		return acc;
+	}, { input: 0, output: 0, total: 0, cost: 0 });
+	if (!totalTokens.cost) delete totalTokens.cost;
+	const totalCost = totalTokens.cost;
+	return {
+		runs,
+		active: runs.filter((run) => run.active),
+		steps: runs.reduce((sum, run) => sum + run.steps, 0),
+		totalTokens,
+		...(totalCost ? { totalCost } : {}),
+	};
 }
 
 function activeOrStale(run: ForkRun): boolean {

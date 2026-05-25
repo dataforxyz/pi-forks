@@ -1,8 +1,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { diagnoseForkRuns, scanForkRuns, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary } from "./monitor.ts";
+import { diagnoseForkRuns, parseSessionTokenFile, scanAgentSpend, scanForkRuns, type AgentSpendSummary, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary, type TokenUsage } from "./monitor.ts";
 
 const EXTENSION_KEY = "pi-forks";
-const TOKEN_STATUS_KEY = "pi-forks-tokens";
+const SPEND_STATUS_KEY = "pi-forks-spend";
 const WIDGET_KEY = "pi-forks";
 const REFRESH_MS = 2_000;
 const TOKEN_REFRESH_MS = 10_000;
@@ -42,9 +42,9 @@ interface ViewOptions {
 
 let latestCtx: ExtensionContext | undefined;
 let refreshTimer: NodeJS.Timeout | undefined;
-let lastTokenStatus: string | undefined;
-let lastTokenStatusAt = 0;
-let lastTokenScopeKey: string | undefined;
+let lastSpendStatus: string | undefined;
+let lastSpendStatusAt = 0;
+let lastSpendScopeKey: string | undefined;
 
 function configuredSource(): ForkSource | undefined {
 	const raw = process.env.PI_FORKS_SOURCE;
@@ -109,8 +109,33 @@ function formatTokens(tokens: number | undefined): string {
 	return `${(tokens / 1_000_000).toFixed(1)}m`;
 }
 
+function ansi256(color: number, text: string): string {
+	return `\x1b[38;5;${color}m${text}\x1b[39m`;
+}
+
 function orange(text: string): string {
-	return `\x1b[38;5;208m${text}\x1b[39m`;
+	return ansi256(208, text);
+}
+
+function cyan(text: string): string {
+	return ansi256(45, text);
+}
+
+function violet(text: string): string {
+	return ansi256(141, text);
+}
+
+function formatCost(cost: number | undefined): string | undefined {
+	if (!cost || cost <= 0) return undefined;
+	if (cost < 0.01) return `$${cost.toFixed(4)}`;
+	if (cost < 1) return `$${cost.toFixed(3)}`;
+	return `$${cost.toFixed(2)}`;
+}
+
+function formatSpend(tokens: TokenUsage | undefined, fallbackCost?: number): string | undefined {
+	if (!tokens || tokens.total <= 0) return undefined;
+	const cost = formatCost(tokens.cost ?? fallbackCost);
+	return cost ? `${formatTokens(tokens.total)}/${cost}` : `${formatTokens(tokens.total)} tok`;
 }
 
 function truncate(text: string, max: number): string {
@@ -219,8 +244,10 @@ function rebuildSummary(runs: ForkRun[]): ForkSummary {
 		acc.input += run.tokens?.input ?? 0;
 		acc.output += run.tokens?.output ?? 0;
 		acc.total += run.tokens?.total ?? 0;
+		acc.cost = (acc.cost ?? 0) + (run.tokens?.cost ?? 0);
 		return acc;
-	}, { input: 0, output: 0, total: 0 });
+	}, { input: 0, output: 0, total: 0, cost: 0 });
+	if (!totalTokens.cost) delete totalTokens.cost;
 	const maxRunningDurationMs = running.reduce((max, run) => Math.max(max, run.durationMs ?? 0), 0);
 	return { runs, running, stale, countsByStatus, totalTokens, maxRunningDurationMs };
 }
@@ -263,11 +290,22 @@ function buildStatus(summary: ForkSummary, _options: ViewOptions, theme?: ThemeL
 	return `${icon} ${count} · ${hint}`;
 }
 
-function buildTokenStatus(summary: ForkSummary): string | undefined {
-	if (summary.totalTokens.total <= 0) return undefined;
-	const runCount = summary.runs.filter((run) => (run.tokens?.total ?? 0) > 0).length;
-	const runLabel = runCount === 1 ? "fork" : "forks";
-	return orange(`↯ ${formatTokens(summary.totalTokens.total)} ${runLabel} tok`);
+function buildSpendStatus(threadTokens: TokenUsage | undefined, agentSpend: AgentSpendSummary, forkSummary: ForkSummary): string | undefined {
+	const parts: string[] = [];
+	const thread = formatSpend(threadTokens);
+	if (thread) parts.push(cyan(`◉ thread ${thread}`));
+	const agents = formatSpend(agentSpend.totalTokens, agentSpend.totalCost);
+	if (agents) {
+		const active = agentSpend.active.length > 0 ? ` (${agentSpend.active.length} active)` : "";
+		parts.push(violet(`◆ agents ${agents}${active}`));
+	}
+	const forks = formatSpend(forkSummary.totalTokens);
+	if (forks) {
+		const runCount = forkSummary.runs.filter((run) => (run.tokens?.total ?? 0) > 0).length;
+		const runLabel = runCount === 1 ? "fork" : "forks";
+		parts.push(orange(`↯ ${runLabel} ${forks}`));
+	}
+	return parts.length > 0 ? parts.join(" · ") : undefined;
 }
 
 function buildWidget(summary: ForkSummary, options: ViewOptions, theme?: ThemeLike): string[] | undefined {
@@ -597,7 +635,7 @@ function defaultOptions(ctx?: ExtensionContext): ViewOptions | undefined {
 	return Object.keys(scope).length > 0 ? { scope: "chat", relatedOnly: true, ...scope } : undefined;
 }
 
-function tokenScopeKey(options: ViewOptions): string {
+function spendScopeKey(options: ViewOptions): string {
 	return JSON.stringify({
 		scope: options.scope,
 		parentSessionFile: options.parentSessionFile,
@@ -607,15 +645,37 @@ function tokenScopeKey(options: ViewOptions): string {
 	});
 }
 
-function updateTokenStatus(ctx: ExtensionContext, options: ViewOptions, now = Date.now()): void {
-	const scopeKey = tokenScopeKey(options);
-	if (scopeKey !== lastTokenScopeKey || now - lastTokenStatusAt >= TOKEN_REFRESH_MS) {
-		const tokenSummary = summarize({ ...options, includeCompleted: true, relatedOnly: true });
-		lastTokenStatus = buildTokenStatus(tokenSummary);
-		lastTokenStatusAt = now;
-		lastTokenScopeKey = scopeKey;
+function currentSpend(options: ViewOptions): { threadTokens?: TokenUsage; agentSpend: AgentSpendSummary; forkSummary: ForkSummary } {
+	return {
+		threadTokens: parseSessionTokenFile(options.parentSessionFile),
+		agentSpend: scanAgentSpend({ parentSessionFile: options.parentSessionFile }),
+		forkSummary: summarize({ ...options, includeCompleted: true, relatedOnly: true }),
+	};
+}
+
+function updateSpendStatus(ctx: ExtensionContext, options: ViewOptions, now = Date.now()): void {
+	const scopeKey = spendScopeKey(options);
+	if (scopeKey !== lastSpendScopeKey || now - lastSpendStatusAt >= TOKEN_REFRESH_MS) {
+		const spend = currentSpend(options);
+		lastSpendStatus = buildSpendStatus(spend.threadTokens, spend.agentSpend, spend.forkSummary);
+		lastSpendStatusAt = now;
+		lastSpendScopeKey = scopeKey;
 	}
-	ctx.ui.setStatus(TOKEN_STATUS_KEY, lastTokenStatus);
+	ctx.ui.setStatus(SPEND_STATUS_KEY, lastSpendStatus);
+}
+
+function formatSpendLine(label: string, tokens: TokenUsage | undefined, extra?: string): string {
+	const spend = formatSpend(tokens) ?? "0 tok";
+	return `${label}: ${spend}${extra ? ` · ${extra}` : ""}`;
+}
+
+function formatSpendReport(options: ViewOptions): string {
+	const spend = currentSpend(options);
+	const lines = ["Pi spend for this thread"];
+	lines.push(formatSpendLine("thread", spend.threadTokens));
+	lines.push(formatSpendLine("agents", spend.agentSpend.totalTokens, `${spend.agentSpend.runs.length} runs · ${spend.agentSpend.steps} steps${spend.agentSpend.active.length ? ` · ${spend.agentSpend.active.length} active` : ""}`));
+	lines.push(formatSpendLine("forks", spend.forkSummary.totalTokens, `${spend.forkSummary.runs.length} related runs${spend.forkSummary.running.length || spend.forkSummary.stale.length ? ` · ${spend.forkSummary.running.length} running · ${spend.forkSummary.stale.length} stale` : ""}`));
+	return lines.join("\n");
 }
 
 function render(ctx = latestCtx): void {
@@ -623,13 +683,13 @@ function render(ctx = latestCtx): void {
 	const options = defaultOptions(ctx);
 	if (!options) {
 		ctx.ui.setStatus(EXTENSION_KEY, undefined);
-		ctx.ui.setStatus(TOKEN_STATUS_KEY, undefined);
+		ctx.ui.setStatus(SPEND_STATUS_KEY, undefined);
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 		return;
 	}
 	const summary = summarize(options);
 	ctx.ui.setStatus(EXTENSION_KEY, buildStatus(summary, options, ctx.ui.theme));
-	updateTokenStatus(ctx, options);
+	updateSpendStatus(ctx, options);
 	ctx.ui.setWidget(WIDGET_KEY, undefined);
 	ctx.ui.requestRender?.();
 }
@@ -643,12 +703,12 @@ function startRefresh(): void {
 function stopRefresh(ctx = latestCtx): void {
 	if (refreshTimer) clearInterval(refreshTimer);
 	refreshTimer = undefined;
-	lastTokenStatus = undefined;
-	lastTokenStatusAt = 0;
-	lastTokenScopeKey = undefined;
+	lastSpendStatus = undefined;
+	lastSpendStatusAt = 0;
+	lastSpendScopeKey = undefined;
 	try {
 		ctx?.ui.setStatus(EXTENSION_KEY, undefined);
-		ctx?.ui.setStatus(TOKEN_STATUS_KEY, undefined);
+		ctx?.ui.setStatus(SPEND_STATUS_KEY, undefined);
 		ctx?.ui.setWidget(WIDGET_KEY, undefined);
 	} catch {
 		// UI context may already be stale during shutdown/reload.
@@ -719,6 +779,22 @@ export default function (pi: ExtensionAPI) {
 			const source = parsed.source;
 			const allSources = parsed.allSources || !source;
 			ctx.ui.notify(formatDiagnostics(diagnoseForkRuns({ includeCompleted: true, ...(allSources ? {} : { source }) }), { source, includeCompleted: true, allSources }, ctx.ui.theme), "info");
+		},
+	});
+
+	pi.registerCommand("pi-spend", {
+		description: "Show this thread's token/cost split across thread, agents, and fork handlers.",
+		handler: async (_args, ctx) => {
+			const options = defaultOptions(ctx) ?? { scope: "chat", relatedOnly: true, ...sessionScope(ctx) };
+			ctx.ui.notify(formatSpendReport(options), "info");
+		},
+	});
+
+	pi.registerCommand("forks-spend", {
+		description: "Alias for /pi-spend.",
+		handler: async (_args, ctx) => {
+			const options = defaultOptions(ctx) ?? { scope: "chat", relatedOnly: true, ...sessionScope(ctx) };
+			ctx.ui.notify(formatSpendReport(options), "info");
 		},
 	});
 

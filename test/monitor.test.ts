@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { diagnoseForkRuns, parseSessionTokens, scanForkRuns } from "../src/monitor.ts";
+import { diagnoseForkRuns, parseSessionTokens, scanAgentSpend, scanForkRuns } from "../src/monitor.ts";
 
 function makeHome(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-forks-test-"));
@@ -17,8 +17,8 @@ function writeJson(filePath: string, value: unknown): void {
 function writeSession(sessionDir: string): void {
 	fs.mkdirSync(sessionDir, { recursive: true });
 	fs.writeFileSync(path.join(sessionDir, "session.jsonl"), [
-		JSON.stringify({ usage: { input: 100, output: 50 } }),
-		JSON.stringify({ message: { usage: { inputTokens: 10, outputTokens: 5 } } }),
+		JSON.stringify({ usage: { input: 100, output: 50, cost: { total: 0.15 } } }),
+		JSON.stringify({ message: { usage: { inputTokens: 10, outputTokens: 5, cost: 0.015 } } }),
 		"",
 	].join("\n"), "utf8");
 }
@@ -27,7 +27,11 @@ test("parseSessionTokens sums direct and nested usage", () => {
 	const home = makeHome();
 	const sessionDir = path.join(home, "sessions");
 	writeSession(sessionDir);
-	assert.deepEqual(parseSessionTokens(sessionDir), { input: 110, output: 55, total: 165 });
+	const tokens = parseSessionTokens(sessionDir);
+	assert.equal(tokens?.input, 110);
+	assert.equal(tokens?.output, 55);
+	assert.equal(tokens?.total, 165);
+	assert.ok(Math.abs((tokens?.cost ?? 0) - 0.165) < 0.000001);
 });
 
 test("scanForkRuns reports running count, durations, and token totals", () => {
@@ -56,10 +60,12 @@ test("scanForkRuns reports running count, durations, and token totals", () => {
 	assert.equal(active.countsByStatus.running, 2);
 	assert.equal(active.maxRunningDurationMs, 9_000);
 	assert.equal(active.totalTokens.total, 330);
+	assert.ok(Math.abs((active.totalTokens.cost ?? 0) - 0.33) < 0.000001);
 
 	const all = scanForkRuns({ homeDir: home, now, includeCompleted: true });
 	assert.equal(all.runs.length, 3);
 	assert.equal(all.totalTokens.total, 495);
+	assert.ok(Math.abs((all.totalTokens.cost ?? 0) - 0.495) < 0.000001);
 
 	const scoped = scanForkRuns({ homeDir: home, now, includeCompleted: true, source: "return_on" });
 	assert.equal(scoped.runs.length, 1);
@@ -67,6 +73,7 @@ test("scanForkRuns reports running count, durations, and token totals", () => {
 	assert.equal(scoped.runs[0]?.intercomTarget, "fork-return-on-1");
 	assert.equal(scoped.runs[0]?.intercomStatusTag, "fork-handler:return-on:roh_1");
 	assert.equal(scoped.totalTokens.total, 165);
+	assert.ok(Math.abs((scoped.totalTokens.cost ?? 0) - 0.165) < 0.000001);
 });
 
 test("scanForkRuns marks dead running pids as stale and preserves raw status", () => {
@@ -116,4 +123,43 @@ test("diagnoseForkRuns reports stale records and duplicate active cwd groups", (
 	assert.equal(diagnostics.totals.running, 1);
 	assert.ok(diagnostics.issues.some((issue) => issue.kind === "stale_pid" && issue.runIds.includes("icfh_dead")));
 	assert.ok(diagnostics.issues.some((issue) => issue.kind === "duplicate_active_cwd" && issue.cwd === cwd));
+});
+
+test("scanAgentSpend totals async subagent runs for a parent session", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-forks-agents-"));
+	const parentSessionFile = path.join(root, "parent.jsonl");
+	writeJson(path.join(root, "run-1/status.json"), {
+		runId: "run-1",
+		sessionId: parentSessionFile,
+		state: "complete",
+		cwd: "/repo",
+		steps: [
+			{
+				tokens: { input: 100, output: 25, total: 125 },
+				modelAttempts: [{ usage: { input: 100, output: 25, cost: { total: 0.125 } } }],
+			},
+			{
+				modelAttempts: [{ usage: { input: 10, output: 5, cost: 0.015 } }],
+			},
+		],
+	});
+	writeJson(path.join(root, "run-2/status.json"), {
+		runId: "run-2",
+		sessionId: parentSessionFile,
+		state: "running",
+		steps: [{ tokens: { input: 1, output: 2, total: 3, cost: 0.003 } }],
+	});
+	writeJson(path.join(root, "other/status.json"), {
+		runId: "other",
+		sessionId: "different.jsonl",
+		state: "complete",
+		steps: [{ tokens: { input: 999, output: 999, total: 1998, cost: 9 } }],
+	});
+
+	const spend = scanAgentSpend({ rootDir: root, parentSessionFile });
+	assert.equal(spend.runs.length, 2);
+	assert.equal(spend.active.length, 1);
+	assert.equal(spend.steps, 3);
+	assert.equal(spend.totalTokens.total, 143);
+	assert.ok(Math.abs((spend.totalCost ?? 0) - 0.143) < 0.000001);
 });
