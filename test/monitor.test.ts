@@ -14,13 +14,19 @@ function writeJson(filePath: string, value: unknown): void {
 	fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
-function writeSession(sessionDir: string): void {
+function writeSession(sessionDir: string, timestamps = false): void {
 	fs.mkdirSync(sessionDir, { recursive: true });
-	fs.writeFileSync(path.join(sessionDir, "session.jsonl"), [
-		JSON.stringify({ usage: { input: 100, output: 50, cost: { total: 0.15 } } }),
-		JSON.stringify({ message: { usage: { inputTokens: 10, outputTokens: 5, cost: 0.015 } } }),
-		"",
-	].join("\n"), "utf8");
+	const lines = timestamps
+		? [
+			JSON.stringify({ timestamp: "2026-01-01T00:00:00.000Z", usage: { input: 999, output: 1, cost: 9 } }),
+			JSON.stringify({ timestamp: "2026-01-01T00:00:10.000Z", usage: { input: 100, output: 50, cost: { total: 0.15 } } }),
+			JSON.stringify({ timestamp: "2026-01-01T00:00:11.000Z", message: { usage: { inputTokens: 10, outputTokens: 5, cost: 0.015 } } }),
+		]
+		: [
+			JSON.stringify({ usage: { input: 100, output: 50, cost: { total: 0.15 } } }),
+			JSON.stringify({ message: { usage: { inputTokens: 10, outputTokens: 5, cost: 0.015 } } }),
+		];
+	fs.writeFileSync(path.join(sessionDir, "session.jsonl"), [...lines, ""].join("\n"), "utf8");
 }
 
 test("parseSessionTokens sums direct and nested usage", () => {
@@ -36,21 +42,21 @@ test("parseSessionTokens sums direct and nested usage", () => {
 
 test("scanForkRuns reports running count, durations, and token totals", () => {
 	const home = makeHome();
-	const now = 10_000;
+	const now = Date.parse("2026-01-01T00:00:20.000Z");
 	const intercomSessionDir = path.join(home, ".local/state/pi-intercom/handlers/icfh_1/sessions");
 	const returnSessionDir = path.join(home, ".local/state/pi-return-on/handlers/roh_1/sessions");
 	const subagentSessionDir = path.join(home, ".local/state/pi-subagents/handlers/sbf_1/sessions");
-	writeSession(intercomSessionDir);
-	writeSession(returnSessionDir);
-	writeSession(subagentSessionDir);
+	writeSession(intercomSessionDir, true);
+	writeSession(returnSessionDir, true);
+	writeSession(subagentSessionDir, true);
 	writeJson(path.join(home, ".local/state/pi-intercom/handlers.json"), {
-		runs: [{ id: "icfh_1", from: "other", status: "running", startedAt: 1_000, pid: process.pid, sessionDir: intercomSessionDir }],
+		runs: [{ id: "icfh_1", from: "other", status: "running", startedAt: Date.parse("2026-01-01T00:00:09.000Z"), pid: process.pid, sessionDir: intercomSessionDir }],
 	});
 	writeJson(path.join(home, ".local/state/pi-return-on/handlers.json"), {
-		handlers: [{ id: "roh_1", label: "build done", status: "complete", startedAt: 2_000, endedAt: 3_000, sessionDir: returnSessionDir }],
+		handlers: [{ id: "roh_1", label: "build done", status: "complete", startedAt: Date.parse("2026-01-01T00:00:09.000Z"), endedAt: Date.parse("2026-01-01T00:00:12.000Z"), sessionDir: returnSessionDir }],
 	});
 	writeJson(path.join(home, ".local/state/pi-subagents/handlers.json"), {
-		handlers: [{ id: "sbf_1", title: "review complete", type: "async-complete", status: "running", startedAt: 4_000, pid: process.pid, sessionDir: subagentSessionDir }],
+		handlers: [{ id: "sbf_1", title: "review complete", type: "async-complete", status: "running", startedAt: Date.parse("2026-01-01T00:00:09.000Z"), pid: process.pid, sessionDir: subagentSessionDir }],
 	});
 
 	const active = scanForkRuns({ homeDir: home, now });
@@ -58,7 +64,7 @@ test("scanForkRuns reports running count, durations, and token totals", () => {
 	assert.equal(active.stale.length, 0);
 	assert.equal(active.runs.length, 2);
 	assert.equal(active.countsByStatus.running, 2);
-	assert.equal(active.maxRunningDurationMs, 9_000);
+	assert.equal(active.maxRunningDurationMs, 11_000);
 	assert.equal(active.totalTokens.total, 330);
 	assert.ok(Math.abs((active.totalTokens.cost ?? 0) - 0.33) < 0.000001);
 

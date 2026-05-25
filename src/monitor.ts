@@ -14,6 +14,10 @@ export interface TokenUsage {
 
 const sessionTokenCache = new Map<string, { mtimeMs: number; size: number; tokens?: TokenUsage }>();
 
+export interface ParseSessionTokenOptions {
+	sinceMs?: number;
+}
+
 export interface ForkRun {
 	source: ForkSource;
 	id: string;
@@ -201,7 +205,18 @@ function usageNumbers(usage: Record<string, unknown>): Pick<TokenUsage, "input" 
 	return { input, output, ...(cost !== undefined ? { cost } : {}) };
 }
 
-export function parseSessionTokenFile(sessionFile: string | undefined): TokenUsage | undefined {
+function entryTimestampMs(entry: Record<string, unknown>): number | undefined {
+	const direct = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : numberValue(entry.timestamp);
+	if (direct !== undefined && Number.isFinite(direct)) return direct;
+	if (typeof entry.message === "object" && entry.message !== null) {
+		const nested = (entry.message as Record<string, unknown>).timestamp;
+		const value = typeof nested === "string" ? Date.parse(nested) : numberValue(nested);
+		if (value !== undefined && Number.isFinite(value)) return value;
+	}
+	return undefined;
+}
+
+export function parseSessionTokenFile(sessionFile: string | undefined, options: ParseSessionTokenOptions = {}): TokenUsage | undefined {
 	if (!sessionFile) return undefined;
 	let stat: fs.Stats;
 	try {
@@ -209,7 +224,8 @@ export function parseSessionTokenFile(sessionFile: string | undefined): TokenUsa
 	} catch {
 		return undefined;
 	}
-	const cached = sessionTokenCache.get(sessionFile);
+	const cacheKey = `${sessionFile}\0${options.sinceMs ?? 0}`;
+	const cached = sessionTokenCache.get(cacheKey);
 	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.tokens ? { ...cached.tokens } : undefined;
 	let input = 0;
 	let output = 0;
@@ -220,6 +236,10 @@ export function parseSessionTokenFile(sessionFile: string | undefined): TokenUsa
 			if (!line.trim()) continue;
 			try {
 				const entry = JSON.parse(line) as Record<string, unknown>;
+				if (options.sinceMs !== undefined) {
+					const timestamp = entryTimestampMs(entry);
+					if (timestamp !== undefined && timestamp < options.sinceMs) continue;
+				}
 				const direct = entry.usage;
 				const nested = typeof entry.message === "object" && entry.message !== null
 					? (entry.message as Record<string, unknown>).usage
@@ -239,13 +259,13 @@ export function parseSessionTokenFile(sessionFile: string | undefined): TokenUsa
 	}
 	const total = input + output;
 	const tokens = total > 0 ? { input, output, total, ...(cost > 0 ? { cost } : {}) } : undefined;
-	sessionTokenCache.set(sessionFile, { mtimeMs: stat.mtimeMs, size: stat.size, tokens });
+	sessionTokenCache.set(cacheKey, { mtimeMs: stat.mtimeMs, size: stat.size, tokens });
 	return tokens ? { ...tokens } : undefined;
 }
 
-export function parseSessionTokens(sessionDir: string | undefined): TokenUsage | undefined {
+export function parseSessionTokens(sessionDir: string | undefined, options: ParseSessionTokenOptions = {}): TokenUsage | undefined {
 	if (!sessionDir) return undefined;
-	return parseSessionTokenFile(findLatestSessionFile(sessionDir));
+	return parseSessionTokenFile(findLatestSessionFile(sessionDir), options);
 }
 
 function mapIntercomRun(run: Record<string, unknown>, now: number): ForkRun | undefined {
@@ -464,7 +484,8 @@ export function scanForkRuns(options: ScanOptions = {}): ForkSummary {
 	const sorted = sortRuns(filtered);
 	const limited = options.limit !== undefined ? sorted.slice(0, options.limit) : sorted;
 	for (const run of limited) {
-		const tokens = parseSessionTokens(run.sessionDir);
+		const sinceMs = run.startedAt !== undefined ? Math.max(0, run.startedAt - 1_000) : undefined;
+		const tokens = parseSessionTokens(run.sessionDir, sinceMs !== undefined ? { sinceMs } : {});
 		if (tokens) run.tokens = tokens;
 	}
 	const running = limited.filter((run) => run.status === "running" || run.status === "starting");
