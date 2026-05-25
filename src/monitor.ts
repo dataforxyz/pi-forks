@@ -11,6 +11,8 @@ export interface TokenUsage {
 	total: number;
 }
 
+const sessionTokenCache = new Map<string, { mtimeMs: number; size: number; tokens?: TokenUsage }>();
+
 export interface ForkRun {
 	source: ForkSource;
 	id: string;
@@ -165,6 +167,14 @@ export function parseSessionTokens(sessionDir: string | undefined): TokenUsage |
 	if (!sessionDir) return undefined;
 	const sessionFile = findLatestSessionFile(sessionDir);
 	if (!sessionFile) return undefined;
+	let stat: fs.Stats;
+	try {
+		stat = fs.statSync(sessionFile);
+	} catch {
+		return undefined;
+	}
+	const cached = sessionTokenCache.get(sessionFile);
+	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.tokens ? { ...cached.tokens } : undefined;
 	let input = 0;
 	let output = 0;
 	try {
@@ -190,7 +200,9 @@ export function parseSessionTokens(sessionDir: string | undefined): TokenUsage |
 		return undefined;
 	}
 	const total = input + output;
-	return total > 0 ? { input, output, total } : undefined;
+	const tokens = total > 0 ? { input, output, total } : undefined;
+	sessionTokenCache.set(sessionFile, { mtimeMs: stat.mtimeMs, size: stat.size, tokens });
+	return tokens ? { ...tokens } : undefined;
 }
 
 function mapIntercomRun(run: Record<string, unknown>, now: number): ForkRun | undefined {

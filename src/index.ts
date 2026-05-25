@@ -2,8 +2,10 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { diagnoseForkRuns, scanForkRuns, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary } from "./monitor.ts";
 
 const EXTENSION_KEY = "pi-forks";
+const TOKEN_STATUS_KEY = "pi-forks-tokens";
 const WIDGET_KEY = "pi-forks";
 const REFRESH_MS = 2_000;
+const TOKEN_REFRESH_MS = 10_000;
 const WIDGET_LIMIT = 8;
 const FORKS_SHORTCUT = "ctrl+alt+f";
 const FORKS_SHORTCUT_ALIAS = "alt+ctrl+f";
@@ -40,6 +42,9 @@ interface ViewOptions {
 
 let latestCtx: ExtensionContext | undefined;
 let refreshTimer: NodeJS.Timeout | undefined;
+let lastTokenStatus: string | undefined;
+let lastTokenStatusAt = 0;
+let lastTokenScopeKey: string | undefined;
 
 function configuredSource(): ForkSource | undefined {
 	const raw = process.env.PI_FORKS_SOURCE;
@@ -102,6 +107,10 @@ function formatTokens(tokens: number | undefined): string {
 	if (tokens < 1000) return String(tokens);
 	if (tokens < 1_000_000) return `${(tokens / 1000).toFixed(tokens < 10_000 ? 1 : 0)}k`;
 	return `${(tokens / 1_000_000).toFixed(1)}m`;
+}
+
+function orange(text: string): string {
+	return `\x1b[38;5;208m${text}\x1b[39m`;
 }
 
 function truncate(text: string, max: number): string {
@@ -252,6 +261,13 @@ function buildStatus(summary: ForkSummary, _options: ViewOptions, theme?: ThemeL
 	const count = theme ? theme.fg(color, countText) : countText;
 	const hint = theme ? theme.fg("dim", FORKS_SHORTCUT_LABEL) : FORKS_SHORTCUT_LABEL;
 	return `${icon} ${count} · ${hint}`;
+}
+
+function buildTokenStatus(summary: ForkSummary): string | undefined {
+	if (summary.totalTokens.total <= 0) return undefined;
+	const runCount = summary.runs.filter((run) => (run.tokens?.total ?? 0) > 0).length;
+	const runLabel = runCount === 1 ? "fork" : "forks";
+	return orange(`↯ ${formatTokens(summary.totalTokens.total)} ${runLabel} tok`);
 }
 
 function buildWidget(summary: ForkSummary, options: ViewOptions, theme?: ThemeLike): string[] | undefined {
@@ -581,16 +597,39 @@ function defaultOptions(ctx?: ExtensionContext): ViewOptions | undefined {
 	return Object.keys(scope).length > 0 ? { scope: "chat", relatedOnly: true, ...scope } : undefined;
 }
 
+function tokenScopeKey(options: ViewOptions): string {
+	return JSON.stringify({
+		scope: options.scope,
+		parentSessionFile: options.parentSessionFile,
+		parentSessionId: options.parentSessionId,
+		parentSessionName: options.parentSessionName,
+		cwd: options.cwd,
+	});
+}
+
+function updateTokenStatus(ctx: ExtensionContext, options: ViewOptions, now = Date.now()): void {
+	const scopeKey = tokenScopeKey(options);
+	if (scopeKey !== lastTokenScopeKey || now - lastTokenStatusAt >= TOKEN_REFRESH_MS) {
+		const tokenSummary = summarize({ ...options, includeCompleted: true, relatedOnly: true });
+		lastTokenStatus = buildTokenStatus(tokenSummary);
+		lastTokenStatusAt = now;
+		lastTokenScopeKey = scopeKey;
+	}
+	ctx.ui.setStatus(TOKEN_STATUS_KEY, lastTokenStatus);
+}
+
 function render(ctx = latestCtx): void {
 	if (!ctx?.hasUI) return;
 	const options = defaultOptions(ctx);
 	if (!options) {
 		ctx.ui.setStatus(EXTENSION_KEY, undefined);
+		ctx.ui.setStatus(TOKEN_STATUS_KEY, undefined);
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 		return;
 	}
 	const summary = summarize(options);
 	ctx.ui.setStatus(EXTENSION_KEY, buildStatus(summary, options, ctx.ui.theme));
+	updateTokenStatus(ctx, options);
 	ctx.ui.setWidget(WIDGET_KEY, undefined);
 	ctx.ui.requestRender?.();
 }
@@ -604,8 +643,12 @@ function startRefresh(): void {
 function stopRefresh(ctx = latestCtx): void {
 	if (refreshTimer) clearInterval(refreshTimer);
 	refreshTimer = undefined;
+	lastTokenStatus = undefined;
+	lastTokenStatusAt = 0;
+	lastTokenScopeKey = undefined;
 	try {
 		ctx?.ui.setStatus(EXTENSION_KEY, undefined);
+		ctx?.ui.setStatus(TOKEN_STATUS_KEY, undefined);
 		ctx?.ui.setWidget(WIDGET_KEY, undefined);
 	} catch {
 		// UI context may already be stale during shutdown/reload.

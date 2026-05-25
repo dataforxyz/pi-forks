@@ -13,6 +13,7 @@ It gives forks their own UI instead of burying fork telemetry inside `pi-interco
 - `/forks <source> --all` to include completed, failed, and unknown handlers for that source.
 - `/forks --all-sources` for the intentional global view.
 - `/forks --health` or `/forks-health` for a text diagnostic report covering stale dead-PID records, failed/unknown handlers, duplicate active handlers in the same cwd, and token totals.
+- A separate orange footer status tracks total related fork token spend as `↯ <tokens> forks tok`, so completed return handlers are visible next to Pi's built-in main-thread token meter.
 
 Currently it reads existing state from:
 
@@ -29,7 +30,7 @@ By default the extension does **not** render a global all-source footer indicato
 PI_FORKS_SOURCE=return_on # or intercom, subagents
 ```
 
-This keeps the default footer scoped to forks related to the current chat/session. Related means the fork names this chat as its parent, this chat is itself the fork session, or the fork shares the same cwd when no parent metadata is available. Fresh sessions stay quiet until they start their own fork. Use `--all-sources`, turn related-only off with `t`, or choose the modal's `all forks` scope only when you explicitly want the global monitor. The footer stays intentionally tiny with one growing pixel-fork icon, for example `┌┬┐ 1 · Ctrl+Alt+F`, `┌┬┬┐ 2 · Ctrl+Alt+F`, up to `┌┬┬┬┬┐+ N · Ctrl+Alt+F`; when other sessions also have forks, the icon can grow from the global running count while the number stays scoped, e.g. `1/2` means one fork in this chat out of two total.
+This keeps the default footer scoped to forks related to the current chat/session. Related means the fork names this chat as its parent, this chat is itself the fork session, or the fork shares the same cwd when no parent metadata is available. Fresh sessions stay quiet until they start their own fork. Use `--all-sources`, turn related-only off with `t`, or choose the modal's `all forks` scope only when you explicitly want the global monitor. The active-fork footer stays intentionally tiny with one growing pixel-fork icon, for example `┌┬┐ 1 · Ctrl+Alt+F`, `┌┬┬┐ 2 · Ctrl+Alt+F`, up to `┌┬┬┬┬┐+ N · Ctrl+Alt+F`; when other sessions also have forks, the icon can grow from the global running count while the number stays scoped, e.g. `1/2` means one fork in this chat out of two total. Fork token spend is a second footer status, e.g. `↯ 42k forks tok`, refreshed periodically and scoped to completed plus active forks related to the current chat.
 
 ## Shared runtime
 
