@@ -282,9 +282,11 @@ function buildStatus(summary: ForkSummary, _options: ViewOptions, theme?: ThemeL
 	const iconText = forkIcon(activeCount);
 	const color = summary.running.length > 0 || globalRunning > 0 ? "success" : "warning";
 	const icon = theme ? theme.fg(color, iconText) : iconText;
-	const countText = globalRunning > summary.running.length || globalStale > summary.stale.length
-		? `${summary.running.length}/${globalRunning} running · ${summary.stale.length}/${globalStale} stale`
-		: `${summary.running.length} running · ${summary.stale.length} stale`;
+	const runningText = globalRunning > summary.running.length ? `${summary.running.length}/${globalRunning} running` : `${summary.running.length} running`;
+	const staleText = globalStale > 0
+		? globalStale > summary.stale.length ? `${summary.stale.length}/${globalStale} stale` : `${summary.stale.length} stale`
+		: undefined;
+	const countText = [runningText, staleText].filter(Boolean).join(" · ");
 	const count = theme ? theme.fg(color, countText) : countText;
 	const hint = theme ? theme.fg("dim", FORKS_SHORTCUT_LABEL) : FORKS_SHORTCUT_LABEL;
 	return `${icon} ${count} · ${hint}`;
@@ -314,7 +316,7 @@ function buildWidget(summary: ForkSummary, options: ViewOptions, theme?: ThemeLi
 	const title = sourceTitle(options.source, !!options.allSources);
 	const lines: string[] = [];
 	lines.push(theme ? theme.fg(active ? "accent" : "muted", `╭─ ${title}`) : `╭─ ${title}`);
-	const meta = `${summary.running.length} running · ${summary.stale.length} stale · ${summary.runs.length} tracked · ${formatTokens(summary.totalTokens.total)} tok`;
+	const meta = [`${summary.running.length} running`, summary.stale.length > 0 ? `${summary.stale.length} stale` : undefined, `${summary.runs.length} tracked`, `${formatTokens(summary.totalTokens.total)} tok`].filter(Boolean).join(" · ");
 	lines.push(theme ? theme.fg("dim", `│  ${meta}`) : `│  ${meta}`);
 	for (const run of summary.runs.slice(0, WIDGET_LIMIT)) {
 		const glyph = theme ? theme.fg(statusColor(run.status), statusGlyph(run.status)) : statusGlyph(run.status);
@@ -357,7 +359,8 @@ function formatCommandOutput(summary: ForkSummary, options: ViewOptions, theme?:
 	const titleText = scopeLabel(options);
 	if (summary.runs.length === 0) return `No ${titleText.toLowerCase()} found.`;
 	const title = theme ? theme.fg("accent", theme.bold(titleText)) : titleText;
-	const header = `${title}: ${summary.running.length} running, ${summary.stale.length} stale, ${summary.runs.length} tracked, ${formatTokens(summary.totalTokens.total)} tokens`;
+	const counts = [`${summary.running.length} running`, summary.stale.length > 0 ? `${summary.stale.length} stale` : undefined, `${summary.runs.length} tracked`, `${formatTokens(summary.totalTokens.total)} tokens`].filter(Boolean).join(", ");
+	const header = `${title}: ${counts}`;
 	return [header, "", ...summary.runs.map((run) => formatRunLine(run, theme))].join("\n");
 }
 
