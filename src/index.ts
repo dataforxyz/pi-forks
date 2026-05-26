@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { diagnoseForkRuns, parseSessionTokenFile, scanAgentSpend, scanForkRuns, type AgentSpendSummary, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary, type TokenUsage } from "./monitor.ts";
+import { diagnoseForkRuns, parseSessionTokenFile, scanAgentSpend, scanForkRuns, sumRunTokens, type AgentSpendSummary, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary, type TokenUsage } from "./monitor.ts";
 import {
 	cyan,
 	formatDuration,
@@ -131,14 +131,7 @@ function rebuildSummary(runs: ForkRun[]): ForkSummary {
 	const stale = runs.filter((run) => run.status === "stale");
 	const countsByStatus: ForkSummary["countsByStatus"] = { starting: 0, running: 0, complete: 0, failed: 0, stale: 0, unknown: 0 };
 	for (const run of runs) countsByStatus[run.status] += 1;
-	const totalTokens = runs.reduce((acc, run) => {
-		acc.input += run.tokens?.input ?? 0;
-		acc.output += run.tokens?.output ?? 0;
-		acc.total += run.tokens?.total ?? 0;
-		acc.cost = (acc.cost ?? 0) + (run.tokens?.cost ?? 0);
-		return acc;
-	}, { input: 0, output: 0, total: 0, cost: 0 });
-	if (!totalTokens.cost) delete totalTokens.cost;
+	const totalTokens = sumRunTokens(runs);
 	const maxRunningDurationMs = running.reduce((max, run) => Math.max(max, run.durationMs ?? 0), 0);
 	return { runs, running, stale, countsByStatus, totalTokens, maxRunningDurationMs };
 }

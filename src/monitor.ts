@@ -553,14 +553,7 @@ export function scanForkRuns(options: ScanOptions = {}): ForkSummary {
 	const stale = limited.filter((run) => run.status === "stale");
 	const countsByStatus: Record<ForkStatus, number> = { starting: 0, running: 0, complete: 0, failed: 0, stale: 0, unknown: 0 };
 	for (const run of limited) countsByStatus[run.status] += 1;
-	const totalTokens = limited.reduce<TokenUsage>((acc, run) => {
-		acc.input += run.tokens?.input ?? 0;
-		acc.output += run.tokens?.output ?? 0;
-		acc.total += run.tokens?.total ?? 0;
-		acc.cost = (acc.cost ?? 0) + (run.tokens?.cost ?? 0);
-		return acc;
-	}, { input: 0, output: 0, total: 0, cost: 0 });
-	if (!totalTokens.cost) delete totalTokens.cost;
+	const totalTokens = sumRunTokens(limited);
 	const maxRunningDurationMs = running.reduce((max, run) => Math.max(max, run.durationMs ?? 0), 0);
 	return { runs: limited, running, stale, countsByStatus, totalTokens, maxRunningDurationMs };
 }
@@ -570,7 +563,11 @@ function defaultAgentRoot(): string {
 	return path.join(os.tmpdir(), `pi-subagents-uid-${uid}`, "async-subagent-runs");
 }
 
-function addTokenUsage(acc: TokenUsage, tokens: TokenUsage | undefined): void {
+export function emptyTokens(): TokenUsage {
+	return { input: 0, output: 0, total: 0, cost: 0 };
+}
+
+export function addTokenUsage(acc: TokenUsage, tokens: TokenUsage | undefined): void {
 	if (!tokens) return;
 	acc.input += tokens.input;
 	acc.output += tokens.output;
@@ -578,21 +575,28 @@ function addTokenUsage(acc: TokenUsage, tokens: TokenUsage | undefined): void {
 	acc.cost = (acc.cost ?? 0) + (tokens.cost ?? 0);
 }
 
+export function finalizeTokens(acc: TokenUsage): TokenUsage {
+	if (!acc.cost) delete acc.cost;
+	return acc;
+}
+
+export function sumRunTokens(runs: Array<{ tokens?: TokenUsage }>): TokenUsage {
+	const acc = emptyTokens();
+	for (const run of runs) addTokenUsage(acc, run.tokens);
+	return finalizeTokens(acc);
+}
+
 function tokensFromAttempts(attempts: unknown): TokenUsage {
-	const tokens: TokenUsage = { input: 0, output: 0, total: 0, cost: 0 };
+	const tokens = emptyTokens();
 	if (!Array.isArray(attempts)) return tokens;
 	for (const attempt of attempts) {
 		if (typeof attempt !== "object" || attempt === null) continue;
 		const usage = (attempt as Record<string, unknown>).usage;
 		if (typeof usage !== "object" || usage === null) continue;
 		const values = usageNumbers(usage as Record<string, unknown>);
-		tokens.input += values.input;
-		tokens.output += values.output;
-		tokens.total += values.input + values.output;
-		tokens.cost = (tokens.cost ?? 0) + (values.cost ?? 0);
+		addTokenUsage(tokens, { input: values.input, output: values.output, total: values.input + values.output, ...(values.cost !== undefined ? { cost: values.cost } : {}) });
 	}
-	if (!tokens.cost) delete tokens.cost;
-	return tokens;
+	return finalizeTokens(tokens);
 }
 
 function stepTokens(step: Record<string, unknown>): TokenUsage {
@@ -631,9 +635,9 @@ export function scanAgentSpend(options: AgentSpendOptions = {}): AgentSpendSumma
 		if (!status) continue;
 		if (parentSessionFile && stringValue(status.sessionId) !== parentSessionFile) continue;
 		const steps = Array.isArray(status.steps) ? status.steps.filter((step) => typeof step === "object" && step !== null) as Array<Record<string, unknown>> : [];
-		const tokens: TokenUsage = { input: 0, output: 0, total: 0, cost: 0 };
+		const tokens = emptyTokens();
 		for (const step of steps) addTokenUsage(tokens, stepTokens(step));
-		if (!tokens.cost) delete tokens.cost;
+		finalizeTokens(tokens);
 		const state = stringValue(status.state);
 		const active = state === "running" || state === "starting" || state === "queued";
 		runs.push({
@@ -648,11 +652,7 @@ export function scanAgentSpend(options: AgentSpendOptions = {}): AgentSpendSumma
 			...(numberValue(status.endedAt) ? { endedAt: numberValue(status.endedAt) } : {}),
 		});
 	}
-	const totalTokens = runs.reduce<TokenUsage>((acc, run) => {
-		addTokenUsage(acc, run.tokens);
-		return acc;
-	}, { input: 0, output: 0, total: 0, cost: 0 });
-	if (!totalTokens.cost) delete totalTokens.cost;
+	const totalTokens = sumRunTokens(runs);
 	const totalCost = totalTokens.cost;
 	return {
 		runs,
