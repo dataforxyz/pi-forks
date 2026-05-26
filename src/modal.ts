@@ -68,7 +68,6 @@ export class ForksModal {
 	private sortMode: SortMode;
 	private sortDesc: boolean;
 	private cachedLines: string[] | undefined;
-	private cachedWidth: number | undefined;
 	private options: ViewOptions;
 	private theme: ThemeLike;
 	private done: () => void;
@@ -177,7 +176,6 @@ export class ForksModal {
 
 	private invalidate(): void {
 		this.cachedLines = undefined;
-		this.cachedWidth = undefined;
 	}
 
 	private clampSelection(count: number): void {
@@ -211,7 +209,6 @@ export class ForksModal {
 			for (const [index, run] of summary.runs.entries()) push(this.formatRunRow(run, index, innerWidth));
 		}
 		this.cachedLines = lines;
-		this.cachedWidth = innerWidth;
 		return lines;
 	}
 
