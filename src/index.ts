@@ -27,6 +27,7 @@ const SORT_ORDER: SortMode[] = ["status", "newest", "oldest", "duration", "sourc
 interface ViewOptions {
 	source?: ForkSource | ForkSource[];
 	includeCompleted?: boolean;
+	includeTokens?: boolean;
 	allSources?: boolean;
 	scope?: ViewScope;
 	parentSessionFile?: string;
@@ -612,6 +613,7 @@ function summarize(options: ViewOptions): ForkSummary {
 			: options.source;
 	const scanned = scanForkRuns({
 		includeCompleted: options.includeCompleted,
+		includeTokens: options.includeTokens,
 		...(allSources || !source ? {} : { source }),
 		...(scope === "user" || options.userOnly ? { userOnly: true } : {}),
 	});

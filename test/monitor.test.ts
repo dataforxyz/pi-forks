@@ -80,6 +80,11 @@ test("scanForkRuns reports running count, durations, and token totals", () => {
 	assert.equal(scoped.runs[0]?.intercomStatusTag, "fork-handler:return-on:roh_1");
 	assert.equal(scoped.totalTokens.total, 165);
 	assert.ok(Math.abs((scoped.totalTokens.cost ?? 0) - 0.165) < 0.000001);
+
+	const withoutTokens = scanForkRuns({ homeDir: home, now, includeCompleted: true, includeTokens: false });
+	assert.equal(withoutTokens.runs.length, 3);
+	assert.equal(withoutTokens.totalTokens.total, 0);
+	assert.equal(withoutTokens.runs.some((run) => run.tokens), false);
 });
 
 test("scanForkRuns marks dead running pids as stale and preserves raw status", () => {
@@ -169,6 +174,13 @@ test("scanAgentSpend totals async subagent runs for a parent session", () => {
 		state: "running",
 		steps: [{ tokens: { input: 1, output: 2, total: 3, cost: 0.003 } }],
 	});
+	writeJson(path.join(root, "run-3/status.json"), {
+		runId: "run-3",
+		sessionId: parentSessionFile,
+		state: "paused",
+		endedAt: 123,
+		steps: [{ tokens: { input: 7, output: 8, total: 15, cost: 0.015 } }],
+	});
 	writeJson(path.join(root, "other/status.json"), {
 		runId: "other",
 		sessionId: "different.jsonl",
@@ -177,9 +189,9 @@ test("scanAgentSpend totals async subagent runs for a parent session", () => {
 	});
 
 	const spend = scanAgentSpend({ rootDir: root, parentSessionFile });
-	assert.equal(spend.runs.length, 2);
+	assert.equal(spend.runs.length, 3);
 	assert.equal(spend.active.length, 1);
-	assert.equal(spend.steps, 3);
-	assert.equal(spend.totalTokens.total, 143);
-	assert.ok(Math.abs((spend.totalCost ?? 0) - 0.143) < 0.000001);
+	assert.equal(spend.steps, 4);
+	assert.equal(spend.totalTokens.total, 158);
+	assert.ok(Math.abs((spend.totalCost ?? 0) - 0.158) < 0.000001);
 });

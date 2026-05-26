@@ -12,7 +12,21 @@ export interface TokenUsage {
 	cost?: number;
 }
 
-const sessionTokenCache = new Map<string, { mtimeMs: number; size: number; tokens?: TokenUsage }>();
+const SESSION_TOKEN_CACHE_VERSION = 1;
+const SESSION_TOKEN_CACHE_LIMIT = 5_000;
+
+interface SessionTokenCacheEntry {
+	mtimeMs: number;
+	size: number;
+	tokens?: TokenUsage;
+	lastAccessedAt?: number;
+}
+
+const sessionTokenCache = new Map<string, SessionTokenCacheEntry>();
+let persistentSessionTokenCacheLoaded = false;
+let persistentSessionTokenCacheDirty = false;
+let persistentSessionTokenCacheSaveTimer: NodeJS.Timeout | undefined;
+let persistentSessionTokenCacheExitHookRegistered = false;
 
 export interface ParseSessionTokenOptions {
 	sinceMs?: number;
@@ -90,6 +104,7 @@ export interface ScanOptions {
 	parentSessionId?: string;
 	parentSessionName?: string;
 	userOnly?: boolean;
+	includeTokens?: boolean;
 }
 
 export interface AgentSpendRun {
@@ -216,6 +231,82 @@ function entryTimestampMs(entry: Record<string, unknown>): number | undefined {
 	return undefined;
 }
 
+function sessionTokenCacheKey(sessionFile: string, options: ParseSessionTokenOptions): string {
+	return JSON.stringify([path.resolve(sessionFile), options.sinceMs ?? 0]);
+}
+
+function sessionTokenCacheFile(homeDir = os.homedir()): string {
+	return process.env.PI_FORKS_TOKEN_CACHE_FILE?.trim() || path.join(homeDir, ".local", "state", "pi-forks", "session-token-cache.json");
+}
+
+function shouldPersistSessionTokenCache(sessionFile: string): boolean {
+	if (process.env.PI_FORKS_TOKEN_CACHE === "0" || process.env.PI_FORKS_TOKEN_CACHE === "false") return false;
+	const home = path.resolve(os.homedir());
+	const resolved = path.resolve(sessionFile);
+	return resolved === home || resolved.startsWith(`${home}${path.sep}`);
+}
+
+function cloneTokens(tokens: TokenUsage | undefined): TokenUsage | undefined {
+	return tokens ? { ...tokens } : undefined;
+}
+
+function loadPersistentSessionTokenCache(): void {
+	if (persistentSessionTokenCacheLoaded) return;
+	persistentSessionTokenCacheLoaded = true;
+	try {
+		const raw = JSON.parse(fs.readFileSync(sessionTokenCacheFile(), "utf8")) as Record<string, unknown>;
+		if (numberValue(raw.version) !== SESSION_TOKEN_CACHE_VERSION || typeof raw.entries !== "object" || raw.entries === null) return;
+		for (const [key, value] of Object.entries(raw.entries as Record<string, unknown>)) {
+			if (typeof value !== "object" || value === null) continue;
+			const entry = value as Record<string, unknown>;
+			const mtimeMs = numberValue(entry.mtimeMs);
+			const size = numberValue(entry.size);
+			if (mtimeMs === undefined || size === undefined) continue;
+			const rawTokens = typeof entry.tokens === "object" && entry.tokens !== null ? entry.tokens as Record<string, unknown> : undefined;
+			const input = rawTokens ? numberValue(rawTokens.input) : undefined;
+			const output = rawTokens ? numberValue(rawTokens.output) : undefined;
+			const total = rawTokens ? numberValue(rawTokens.total) : undefined;
+			const cost = rawTokens ? numberValue(rawTokens.cost) : undefined;
+			const tokens = input !== undefined && output !== undefined && total !== undefined ? { input, output, total, ...(cost ? { cost } : {}) } : undefined;
+			sessionTokenCache.set(key, { mtimeMs, size, ...(tokens ? { tokens } : {}), ...(numberValue(entry.lastAccessedAt) ? { lastAccessedAt: numberValue(entry.lastAccessedAt) } : {}) });
+		}
+	} catch {
+		// Missing or corrupt cache just means the next scan rebuilds it.
+	}
+}
+
+function flushPersistentSessionTokenCache(): void {
+	if (!persistentSessionTokenCacheDirty) return;
+	persistentSessionTokenCacheDirty = false;
+	if (persistentSessionTokenCacheSaveTimer) {
+		clearTimeout(persistentSessionTokenCacheSaveTimer);
+		persistentSessionTokenCacheSaveTimer = undefined;
+	}
+	try {
+		const entries = [...sessionTokenCache.entries()]
+			.sort((a, b) => (b[1].lastAccessedAt ?? 0) - (a[1].lastAccessedAt ?? 0))
+			.slice(0, SESSION_TOKEN_CACHE_LIMIT);
+		const filePath = sessionTokenCacheFile();
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+		fs.writeFileSync(tmp, `${JSON.stringify({ version: SESSION_TOKEN_CACHE_VERSION, updatedAt: Date.now(), entries: Object.fromEntries(entries) })}\n`, "utf8");
+		fs.renameSync(tmp, filePath);
+	} catch {
+		// Token cache is an optimization; never break fork monitoring if it cannot be written.
+	}
+}
+
+function schedulePersistentSessionTokenCacheSave(): void {
+	persistentSessionTokenCacheDirty = true;
+	if (!persistentSessionTokenCacheExitHookRegistered) {
+		persistentSessionTokenCacheExitHookRegistered = true;
+		process.once("beforeExit", flushPersistentSessionTokenCache);
+	}
+	if (persistentSessionTokenCacheSaveTimer) return;
+	persistentSessionTokenCacheSaveTimer = setTimeout(flushPersistentSessionTokenCache, 1_000);
+	persistentSessionTokenCacheSaveTimer.unref?.();
+}
+
 export function parseSessionTokenFile(sessionFile: string | undefined, options: ParseSessionTokenOptions = {}): TokenUsage | undefined {
 	if (!sessionFile) return undefined;
 	let stat: fs.Stats;
@@ -224,9 +315,15 @@ export function parseSessionTokenFile(sessionFile: string | undefined, options: 
 	} catch {
 		return undefined;
 	}
-	const cacheKey = `${sessionFile}\0${options.sinceMs ?? 0}`;
+	const persistCache = shouldPersistSessionTokenCache(sessionFile);
+	if (persistCache) loadPersistentSessionTokenCache();
+	const cacheKey = sessionTokenCacheKey(sessionFile, options);
 	const cached = sessionTokenCache.get(cacheKey);
-	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.tokens ? { ...cached.tokens } : undefined;
+	if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+		cached.lastAccessedAt = Date.now();
+		if (persistCache) schedulePersistentSessionTokenCacheSave();
+		return cloneTokens(cached.tokens);
+	}
 	let input = 0;
 	let output = 0;
 	let cost = 0;
@@ -259,8 +356,9 @@ export function parseSessionTokenFile(sessionFile: string | undefined, options: 
 	}
 	const total = input + output;
 	const tokens = total > 0 ? { input, output, total, ...(cost > 0 ? { cost } : {}) } : undefined;
-	sessionTokenCache.set(cacheKey, { mtimeMs: stat.mtimeMs, size: stat.size, tokens });
-	return tokens ? { ...tokens } : undefined;
+	sessionTokenCache.set(cacheKey, { mtimeMs: stat.mtimeMs, size: stat.size, ...(tokens ? { tokens } : {}), lastAccessedAt: Date.now() });
+	if (persistCache) schedulePersistentSessionTokenCacheSave();
+	return cloneTokens(tokens);
 }
 
 export function parseSessionTokens(sessionDir: string | undefined, options: ParseSessionTokenOptions = {}): TokenUsage | undefined {
@@ -483,10 +581,12 @@ export function scanForkRuns(options: ScanOptions = {}): ForkSummary {
 	const filtered = scoped.filter((run) => options.includeCompleted || run.status === "running" || run.status === "starting" || run.status === "stale");
 	const sorted = sortRuns(filtered);
 	const limited = options.limit !== undefined ? sorted.slice(0, options.limit) : sorted;
-	for (const run of limited) {
-		const sinceMs = run.startedAt !== undefined ? Math.max(0, run.startedAt - 1_000) : undefined;
-		const tokens = parseSessionTokens(run.sessionDir, sinceMs !== undefined ? { sinceMs } : {});
-		if (tokens) run.tokens = tokens;
+	if (options.includeTokens !== false) {
+		for (const run of limited) {
+			const sinceMs = run.startedAt !== undefined ? Math.max(0, run.startedAt - 1_000) : undefined;
+			const tokens = parseSessionTokens(run.sessionDir, sinceMs !== undefined ? { sinceMs } : {});
+			if (tokens) run.tokens = tokens;
+		}
 	}
 	const running = limited.filter((run) => run.status === "running" || run.status === "starting");
 	const stale = limited.filter((run) => run.status === "stale");
@@ -574,7 +674,7 @@ export function scanAgentSpend(options: AgentSpendOptions = {}): AgentSpendSumma
 		for (const step of steps) addTokenUsage(tokens, stepTokens(step));
 		if (!tokens.cost) delete tokens.cost;
 		const state = stringValue(status.state);
-		const active = state === "running" || state === "starting" || state === "paused";
+		const active = state === "running" || state === "starting" || state === "queued";
 		runs.push({
 			id: stringValue(status.runId) ?? entry.name,
 			...(state ? { state } : {}),
