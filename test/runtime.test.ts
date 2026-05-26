@@ -1,6 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { forkHandlerKind, forkSourceForKind, shortForkRunId, sanitizeSegment } from "../src/runtime.ts";
+import { forkHandlerKind, forkSourceForKind, shortForkRunId, sanitizeSegment, sourceColor, sourceLabel } from "../src/runtime.ts";
+
+test("sourceLabel returns display label per source", () => {
+	assert.equal(sourceLabel("intercom"), "intercom");
+	assert.equal(sourceLabel("return_on"), "return_on");
+	assert.equal(sourceLabel("subagents"), "subagents");
+});
+
+test("sourceColor returns theme color per source", () => {
+	assert.equal(sourceColor("intercom"), "accent");
+	assert.equal(sourceColor("return_on"), "warning");
+	assert.equal(sourceColor("subagents"), "success");
+});
 
 test("forkHandlerKind maps each source to its handler kind", () => {
 	assert.equal(forkHandlerKind("intercom"), "intercom");

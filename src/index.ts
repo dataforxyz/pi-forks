@@ -15,6 +15,7 @@ import {
 	type ThemeLike,
 } from "./formatting.ts";
 import { ForksModal, SORT_ORDER, type ModalDeps, type SortMode, type ViewOptions, type ViewScope } from "./modal.ts";
+import { sourceColor, sourceLabel } from "./runtime.ts";
 
 const EXTENSION_KEY = "pi-forks";
 const SPEND_STATUS_KEY = "pi-forks-spend";
@@ -79,12 +80,6 @@ function parseArgs(args: string): ViewOptions {
 	return { source, includeCompleted, allSources, sortDesc, diagnose, ...(relatedFlag || unrelatedFlag ? { relatedOnly: relatedFlag && !unrelatedFlag } : {}), ...(scope ? { scope } : {}), ...(sortMode ? { sortMode } : {}) };
 }
 
-function sourceLabel(source: ForkRun["source"]): string {
-	if (source === "return_on") return "return_on";
-	if (source === "intercom") return "intercom";
-	return "subagents";
-}
-
 function scopeLabel(options: ViewOptions): string {
 	if (options.scope === "chat") return "this chat";
 	if (options.scope === "response_handlers") return "response handlers";
@@ -100,12 +95,6 @@ function sourceTitle(source: ForkSource | ForkSource[] | undefined, allSources: 
 	if (!source) return "Fork handlers";
 	if (Array.isArray(source)) return `${source.map(sourceLabel).join("+")} forks`;
 	return `${sourceLabel(source)} forks`;
-}
-
-function sourceColor(source: ForkRun["source"]): string {
-	if (source === "return_on") return "warning";
-	if (source === "intercom") return "accent";
-	return "success";
 }
 
 function fileInsideDir(file: string | undefined, dir: string | undefined): boolean {

@@ -71,6 +71,18 @@ export function forkHandlerKind(source: ForkSource): ForkHandlerKind {
 	return "intercom";
 }
 
+export function sourceLabel(source: ForkSource): string {
+	if (source === "return_on") return "return_on";
+	if (source === "intercom") return "intercom";
+	return "subagents";
+}
+
+export function sourceColor(source: ForkSource): string {
+	if (source === "return_on") return "warning";
+	if (source === "intercom") return "accent";
+	return "success";
+}
+
 export function forkSourceForKind(kind: ForkHandlerKind): ForkSource {
 	if (kind === "return-on") return "return_on";
 	if (kind === "subagent") return "subagents";
