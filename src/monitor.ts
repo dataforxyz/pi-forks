@@ -366,7 +366,13 @@ export function parseSessionTokens(sessionDir: string | undefined, options: Pars
 	return parseSessionTokenFile(findLatestSessionFile(sessionDir), options);
 }
 
-function mapIntercomRun(run: Record<string, unknown>, now: number): ForkRun | undefined {
+interface RunMapperSpec {
+	source: ForkSource;
+	label: (run: Record<string, unknown>, id: string) => string;
+	detail?: (run: Record<string, unknown>) => string | undefined;
+}
+
+function mapForkRun(run: Record<string, unknown>, now: number, spec: RunMapperSpec): ForkRun | undefined {
 	const id = stringValue(run.id);
 	if (!id) return undefined;
 	const startedAt = numberValue(run.startedAt);
@@ -376,25 +382,27 @@ function mapIntercomRun(run: Record<string, unknown>, now: number): ForkRun | un
 	const rawStatus = statusValue(run.status);
 	const status = effectiveStatus(rawStatus, pidAlive);
 	const reason = staleReason(rawStatus, pid, pidAlive);
-	const from = stringValue(run.from);
-	const messageId = stringValue(run.messageId);
+	const cwd = stringValue(run.cwd);
+	const dir = stringValue(run.dir);
 	const sessionDir = stringValue(run.sessionDir);
 	const parentIntercomTarget = stringValue(run.parentIntercomTarget) ?? stringValue(run.parentSessionName);
 	const parentSessionFile = stringValue(run.parentSessionFile);
 	const parentSessionId = stringValue(run.parentSessionId);
 	const parentSessionName = stringValue(run.parentSessionName);
+	const duration = computeDuration(startedAt, endedAt, now);
+	const detail = spec.detail?.(run);
 	return {
-		source: "intercom",
+		source: spec.source,
 		id,
-		label: from ? `from ${from}` : id,
+		label: spec.label(run, id),
 		status,
 		...(rawStatus !== status ? { rawStatus } : {}),
 		...(reason ? { staleReason: reason } : {}),
-		...intercomMetadata("intercom", id),
+		...intercomMetadata(spec.source, id),
 		...(pid !== undefined ? { pid } : {}),
 		...(pidAlive !== undefined ? { pidAlive } : {}),
-		...(stringValue(run.cwd) ? { cwd: stringValue(run.cwd) } : {}),
-		...(stringValue(run.dir) ? { dir: stringValue(run.dir) } : {}),
+		...(cwd ? { cwd } : {}),
+		...(dir ? { dir } : {}),
 		...(sessionDir ? { sessionDir } : {}),
 		...(parentIntercomTarget ? { parentIntercomTarget } : {}),
 		...(parentSessionFile ? { parentSessionFile } : {}),
@@ -402,89 +410,42 @@ function mapIntercomRun(run: Record<string, unknown>, now: number): ForkRun | un
 		...(parentSessionName ? { parentSessionName } : {}),
 		...(startedAt !== undefined ? { startedAt } : {}),
 		...(endedAt !== undefined ? { endedAt } : {}),
-		...(computeDuration(startedAt, endedAt, now) !== undefined ? { durationMs: computeDuration(startedAt, endedAt, now) } : {}),
-		...(messageId ? { detail: `message ${messageId}` } : {}),
+		...(duration !== undefined ? { durationMs: duration } : {}),
+		...(detail ? { detail } : {}),
 	};
+}
+
+function mapIntercomRun(run: Record<string, unknown>, now: number): ForkRun | undefined {
+	return mapForkRun(run, now, {
+		source: "intercom",
+		label: (entry, id) => {
+			const from = stringValue(entry.from);
+			return from ? `from ${from}` : id;
+		},
+		detail: (entry) => {
+			const messageId = stringValue(entry.messageId);
+			return messageId ? `message ${messageId}` : undefined;
+		},
+	});
 }
 
 function mapReturnOnRun(run: Record<string, unknown>, now: number): ForkRun | undefined {
-	const id = stringValue(run.id);
-	if (!id) return undefined;
-	const startedAt = numberValue(run.startedAt);
-	const endedAt = numberValue(run.endedAt);
-	const pid = numberValue(run.pid);
-	const pidAlive = isProcessAlive(pid);
-	const rawStatus = statusValue(run.status);
-	const status = effectiveStatus(rawStatus, pidAlive);
-	const reason = staleReason(rawStatus, pid, pidAlive);
-	const sessionDir = stringValue(run.sessionDir);
-	const label = stringValue(run.label) ?? stringValue(run.jobId) ?? id;
-	const parentIntercomTarget = stringValue(run.parentIntercomTarget) ?? stringValue(run.parentSessionName);
-	const parentSessionFile = stringValue(run.parentSessionFile);
-	const parentSessionId = stringValue(run.parentSessionId);
-	const parentSessionName = stringValue(run.parentSessionName);
-	return {
+	return mapForkRun(run, now, {
 		source: "return_on",
-		id,
-		label,
-		status,
-		...(rawStatus !== status ? { rawStatus } : {}),
-		...(reason ? { staleReason: reason } : {}),
-		...intercomMetadata("return_on", id),
-		...(pid !== undefined ? { pid } : {}),
-		...(pidAlive !== undefined ? { pidAlive } : {}),
-		...(stringValue(run.cwd) ? { cwd: stringValue(run.cwd) } : {}),
-		...(stringValue(run.dir) ? { dir: stringValue(run.dir) } : {}),
-		...(sessionDir ? { sessionDir } : {}),
-		...(parentIntercomTarget ? { parentIntercomTarget } : {}),
-		...(parentSessionFile ? { parentSessionFile } : {}),
-		...(parentSessionId ? { parentSessionId } : {}),
-		...(parentSessionName ? { parentSessionName } : {}),
-		...(startedAt !== undefined ? { startedAt } : {}),
-		...(endedAt !== undefined ? { endedAt } : {}),
-		...(computeDuration(startedAt, endedAt, now) !== undefined ? { durationMs: computeDuration(startedAt, endedAt, now) } : {}),
-		...(stringValue(run.jobId) ? { detail: `job ${stringValue(run.jobId)}` } : {}),
-	};
+		label: (entry, id) => stringValue(entry.label) ?? stringValue(entry.jobId) ?? id,
+		detail: (entry) => {
+			const jobId = stringValue(entry.jobId);
+			return jobId ? `job ${jobId}` : undefined;
+		},
+	});
 }
 
 function mapSubagentRun(run: Record<string, unknown>, now: number): ForkRun | undefined {
-	const id = stringValue(run.id);
-	if (!id) return undefined;
-	const startedAt = numberValue(run.startedAt);
-	const endedAt = numberValue(run.endedAt);
-	const pid = numberValue(run.pid);
-	const pidAlive = isProcessAlive(pid);
-	const rawStatus = statusValue(run.status);
-	const status = effectiveStatus(rawStatus, pidAlive);
-	const reason = staleReason(rawStatus, pid, pidAlive);
-	const sessionDir = stringValue(run.sessionDir);
-	const title = stringValue(run.title) ?? id;
-	const parentIntercomTarget = stringValue(run.parentIntercomTarget) ?? stringValue(run.parentSessionName);
-	const parentSessionFile = stringValue(run.parentSessionFile);
-	const parentSessionId = stringValue(run.parentSessionId);
-	const parentSessionName = stringValue(run.parentSessionName);
-	return {
+	return mapForkRun(run, now, {
 		source: "subagents",
-		id,
-		label: title,
-		status,
-		...(rawStatus !== status ? { rawStatus } : {}),
-		...(reason ? { staleReason: reason } : {}),
-		...intercomMetadata("subagents", id),
-		...(pid !== undefined ? { pid } : {}),
-		...(pidAlive !== undefined ? { pidAlive } : {}),
-		...(stringValue(run.cwd) ? { cwd: stringValue(run.cwd) } : {}),
-		...(stringValue(run.dir) ? { dir: stringValue(run.dir) } : {}),
-		...(sessionDir ? { sessionDir } : {}),
-		...(parentIntercomTarget ? { parentIntercomTarget } : {}),
-		...(parentSessionFile ? { parentSessionFile } : {}),
-		...(parentSessionId ? { parentSessionId } : {}),
-		...(parentSessionName ? { parentSessionName } : {}),
-		...(startedAt !== undefined ? { startedAt } : {}),
-		...(endedAt !== undefined ? { endedAt } : {}),
-		...(computeDuration(startedAt, endedAt, now) !== undefined ? { durationMs: computeDuration(startedAt, endedAt, now) } : {}),
-		...(stringValue(run.type) ? { detail: stringValue(run.type) } : {}),
-	};
+		label: (entry, id) => stringValue(entry.title) ?? id,
+		detail: (entry) => stringValue(entry.type),
+	});
 }
 
 function statTime(filePath: string): number | undefined {
