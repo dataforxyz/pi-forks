@@ -1,30 +1,21 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { diagnoseForkRuns, parseSessionTokenFile, scanAgentSpend, scanForkRuns, scanObservationalMemorySpend, sumRunTokens, type AgentSpendSummary, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary, type ObservationalMemorySpendSummary, type TokenUsage } from "./monitor.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { diagnoseForkRuns, scanForkRuns, sumRunTokens, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary } from "./monitor.ts";
 import {
-	cyan,
 	formatDuration,
-	formatSpend,
 	formatTokens,
 	forkIcon,
-	green,
-	orange,
 	runStats,
 	statusColor,
 	statusGlyph,
 	truncate,
-	violet,
 	type ThemeLike,
 } from "./formatting.ts";
 import { ForksModal, SORT_ORDER, type ModalDeps, type SortMode, type ViewOptions, type ViewScope } from "./modal.ts";
 import { sourceColor, sourceLabel } from "./runtime.ts";
 
 const EXTENSION_KEY = "pi-forks";
-const SPEND_STATUS_KEY = "pi-forks-spend";
 const WIDGET_KEY = "pi-forks";
 const REFRESH_MS = 2_000;
-const TOKEN_REFRESH_MS = 10_000;
 const WIDGET_LIMIT = 8;
 const FORKS_SHORTCUT = "ctrl+alt+f";
 const FORKS_SHORTCUT_ALIAS = "alt+ctrl+f";
@@ -34,18 +25,6 @@ const SOURCES: ForkSource[] = ["intercom", "return_on", "subagents"];
 
 let latestCtx: ExtensionContext | undefined;
 let refreshTimer: NodeJS.Timeout | undefined;
-let lastSpendStatus: string | undefined;
-let lastSpendStatusAt = 0;
-let lastSpendScopeKey: string | undefined;
-
-type SpendSnapshot = {
-	threadTokens?: TokenUsage;
-	agentSpend: AgentSpendSummary;
-	forkSummary: ForkSummary;
-	memorySpend: ObservationalMemorySpendSummary;
-	memoryPricingModel?: string;
-};
-
 function configuredSource(): ForkSource | undefined {
 	const raw = process.env.PI_FORKS_SOURCE;
 	return SOURCES.includes(raw as ForkSource) ? raw as ForkSource : undefined;
@@ -174,29 +153,6 @@ function buildStatus(summary: ForkSummary, _options: ViewOptions, theme?: ThemeL
 	const count = theme ? theme.fg(color, countText) : countText;
 	const hint = theme ? theme.fg("dim", FORKS_SHORTCUT_LABEL) : FORKS_SHORTCUT_LABEL;
 	return `${icon} ${count} · ${hint}`;
-}
-
-function buildSpendStatus(threadTokens: TokenUsage | undefined, agentSpend: AgentSpendSummary, forkSummary: ForkSummary, memorySpend: ObservationalMemorySpendSummary): string | undefined {
-	const parts: string[] = [];
-	const thread = formatSpend(threadTokens);
-	if (thread) parts.push(cyan(`◉ dialog ${thread}`));
-	const agents = formatSpend(agentSpend.totalTokens, agentSpend.totalCost);
-	if (agents) {
-		const active = agentSpend.active.length > 0 ? ` (${agentSpend.active.length} active)` : "";
-		parts.push(violet(`◆ agents ${agents}${active}`));
-	}
-	const forks = formatSpend(forkSummary.totalTokens);
-	if (forks) {
-		const runCount = forkSummary.runs.filter((run) => (run.tokens?.total ?? 0) > 0).length;
-		const runLabel = runCount === 1 ? "fork" : "forks";
-		parts.push(orange(`↯ ${runLabel} ${forks}`));
-	}
-	if (memorySpend.visibleTokens.total > 0 || memorySpend.fullTokens.total > 0) {
-		const visible = formatSpend(memorySpend.visibleTokens) ?? `${formatTokens(memorySpend.visibleTokens.total)} tok`;
-		const full = memorySpend.fullTokens.total > memorySpend.visibleTokens.total ? ` · ${formatSpend(memorySpend.fullTokens) ?? `${formatTokens(memorySpend.fullTokens.total)} tok`} full` : "";
-		parts.push(green(`✦ mem ${visible} ctx${full}`));
-	}
-	return parts.length > 0 ? parts.join(" · ") : undefined;
 }
 
 function buildWidget(summary: ForkSummary, options: ViewOptions, theme?: ThemeLike): string[] | undefined {
@@ -345,137 +301,16 @@ function defaultOptions(ctx?: ExtensionContext): ViewOptions | undefined {
 	return Object.keys(scope).length > 0 ? { scope: "chat", relatedOnly: true, ...scope } : undefined;
 }
 
-function spendScopeKey(options: ViewOptions): string {
-	return JSON.stringify({
-		scope: options.scope,
-		parentSessionFile: options.parentSessionFile,
-		parentSessionId: options.parentSessionId,
-		parentSessionName: options.parentSessionName,
-		cwd: options.cwd,
-	});
-}
-
-function currentBranchEntries(ctx: ExtensionContext | undefined): unknown[] {
-	try {
-		return (ctx?.sessionManager.getBranch() as unknown[] | undefined) ?? [];
-	} catch {
-		return [];
-	}
-}
-
-function modelInputCostPerMillion(model: unknown): number | undefined {
-	const record = typeof model === "object" && model !== null ? model as Record<string, unknown> : undefined;
-	const cost = typeof record?.cost === "object" && record.cost !== null ? record.cost as Record<string, unknown> : undefined;
-	const input = cost?.input;
-	return typeof input === "number" && Number.isFinite(input) && input > 0 ? input : undefined;
-}
-
-function modelDisplayName(model: unknown): string | undefined {
-	const record = typeof model === "object" && model !== null ? model as Record<string, unknown> : undefined;
-	const provider = typeof record?.provider === "string" ? record.provider : undefined;
-	const id = typeof record?.id === "string" ? record.id : undefined;
-	if (provider && id) return `${provider}/${id}`;
-	return id ?? provider;
-}
-
-function recordValue(value: unknown): Record<string, unknown> | undefined {
-	return typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
-}
-
-function readObservationalMemoryModelConfig(path: string): { provider: string; id: string } | undefined {
-	if (!existsSync(path)) return undefined;
-	try {
-		const root = recordValue(JSON.parse(readFileSync(path, "utf8")));
-		const settings = recordValue(root?.["observational-memory"]);
-		const model = recordValue(settings?.model);
-		const provider = typeof model?.provider === "string" ? model.provider : undefined;
-		const id = typeof model?.id === "string" ? model.id : undefined;
-		return provider && id ? { provider, id } : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function resolveObservationalMemoryModel(ctx: ExtensionContext | undefined): unknown {
-	if (!ctx) return undefined;
-	const globalModel = readObservationalMemoryModelConfig(join(getAgentDir(), "settings.json"));
-	const projectModel = readObservationalMemoryModelConfig(join(ctx.cwd, ".pi", "settings.json"));
-	const configured = projectModel ?? globalModel;
-	if (configured) return ctx.modelRegistry.find(configured.provider, configured.id) ?? ctx.model;
-	return ctx.model;
-}
-
-function estimateInputCost(tokens: TokenUsage, inputCostPerMillion: number | undefined): TokenUsage {
-	if (!inputCostPerMillion || tokens.total <= 0) return tokens;
-	return { ...tokens, cost: (inputCostPerMillion / 1_000_000) * tokens.total };
-}
-
-function withMemoryInputCost(memorySpend: ObservationalMemorySpendSummary, model: unknown): ObservationalMemorySpendSummary {
-	const inputCostPerMillion = modelInputCostPerMillion(model);
-	return {
-		...memorySpend,
-		visibleTokens: estimateInputCost(memorySpend.visibleTokens, inputCostPerMillion),
-		fullTokens: estimateInputCost(memorySpend.fullTokens, inputCostPerMillion),
-	};
-}
-
-function currentSpend(options: ViewOptions, ctx?: ExtensionContext): SpendSnapshot {
-	const rawMemorySpend = scanObservationalMemorySpend(currentBranchEntries(ctx));
-	const memoryModel = resolveObservationalMemoryModel(ctx);
-	return {
-		threadTokens: parseSessionTokenFile(options.parentSessionFile),
-		agentSpend: scanAgentSpend({ parentSessionFile: options.parentSessionFile }),
-		forkSummary: summarize({ ...options, includeCompleted: true, relatedOnly: true }),
-		memorySpend: withMemoryInputCost(rawMemorySpend, memoryModel),
-		memoryPricingModel: modelInputCostPerMillion(memoryModel) ? modelDisplayName(memoryModel) : undefined,
-	};
-}
-
-function updateSpendStatus(ctx: ExtensionContext, options: ViewOptions, now = Date.now()): void {
-	const scopeKey = spendScopeKey(options);
-	if (scopeKey !== lastSpendScopeKey || now - lastSpendStatusAt >= TOKEN_REFRESH_MS) {
-		const spend = currentSpend(options, ctx);
-		lastSpendStatus = buildSpendStatus(spend.threadTokens, spend.agentSpend, spend.forkSummary, spend.memorySpend);
-		lastSpendStatusAt = now;
-		lastSpendScopeKey = scopeKey;
-	}
-	ctx.ui.setStatus(SPEND_STATUS_KEY, lastSpendStatus);
-}
-
-function formatSpendLine(label: string, tokens: TokenUsage | undefined, extra?: string): string {
-	const spend = formatSpend(tokens) ?? "0 tok";
-	return `${label}: ${spend}${extra ? ` · ${extra}` : ""}`;
-}
-
-function formatMemorySpendLine(memory: ObservationalMemorySpendSummary, pricingModel?: string): string {
-	const visible = formatSpend(memory.visibleTokens) ?? "0 tok";
-	const full = formatSpend(memory.fullTokens) ?? "0 tok";
-	const pricedAs = pricingModel ? ` · priced as ${pricingModel} input` : "";
-	return `memory: ${visible} visible context · ${full} full active (${memory.visibleObservations} obs/${memory.visibleReflections} refl visible · ${memory.fullObservations} obs/${memory.fullReflections} refl active${memory.droppedObservations ? ` · ${memory.droppedObservations} dropped` : ""}${pricedAs})`;
-}
-
-function formatSpendReport(options: ViewOptions, ctx?: ExtensionContext): string {
-	const spend = currentSpend(options, ctx);
-	const lines = ["Pi spend for this dialog"];
-	lines.push(formatSpendLine("dialog", spend.threadTokens));
-	lines.push(formatSpendLine("agents", spend.agentSpend.totalTokens, `${spend.agentSpend.runs.length} runs · ${spend.agentSpend.steps} steps${spend.agentSpend.active.length ? ` · ${spend.agentSpend.active.length} active` : ""}`));
-	lines.push(formatSpendLine("forks", spend.forkSummary.totalTokens, `${spend.forkSummary.runs.length} related runs${spend.forkSummary.running.length || spend.forkSummary.stale.length ? ` · ${spend.forkSummary.running.length} running · ${spend.forkSummary.stale.length} stale` : ""}`));
-	lines.push(formatMemorySpendLine(spend.memorySpend, spend.memoryPricingModel));
-	return lines.join("\n");
-}
-
 function render(ctx = latestCtx): void {
 	if (!ctx?.hasUI) return;
 	const options = defaultOptions(ctx);
 	if (!options) {
 		ctx.ui.setStatus(EXTENSION_KEY, undefined);
-		ctx.ui.setStatus(SPEND_STATUS_KEY, undefined);
 		ctx.ui.setWidget(WIDGET_KEY, undefined);
 		return;
 	}
 	const summary = summarize(options);
 	ctx.ui.setStatus(EXTENSION_KEY, buildStatus(summary, options, ctx.ui.theme));
-	updateSpendStatus(ctx, options);
 	ctx.ui.setWidget(WIDGET_KEY, undefined);
 	ctx.ui.requestRender?.();
 }
@@ -489,12 +324,8 @@ function startRefresh(): void {
 function stopRefresh(ctx = latestCtx): void {
 	if (refreshTimer) clearInterval(refreshTimer);
 	refreshTimer = undefined;
-	lastSpendStatus = undefined;
-	lastSpendStatusAt = 0;
-	lastSpendScopeKey = undefined;
 	try {
 		ctx?.ui.setStatus(EXTENSION_KEY, undefined);
-		ctx?.ui.setStatus(SPEND_STATUS_KEY, undefined);
 		ctx?.ui.setWidget(WIDGET_KEY, undefined);
 	} catch {
 		// UI context may already be stale during shutdown/reload.
@@ -565,22 +396,6 @@ export default function (pi: ExtensionAPI) {
 			const source = parsed.source;
 			const allSources = parsed.allSources || !source;
 			ctx.ui.notify(formatDiagnostics(diagnoseForkRuns({ includeCompleted: true, ...(allSources ? {} : { source }) }), { source, includeCompleted: true, allSources }, ctx.ui.theme), "info");
-		},
-	});
-
-	pi.registerCommand("pi-spend", {
-		description: "Show this dialog's token/cost split across dialog, agents, fork handlers, and observational memory.",
-		handler: async (_args, ctx) => {
-			const options = defaultOptions(ctx) ?? { scope: "chat", relatedOnly: true, ...sessionScope(ctx) };
-			ctx.ui.notify(formatSpendReport(options, ctx), "info");
-		},
-	});
-
-	pi.registerCommand("forks-spend", {
-		description: "Alias for /pi-spend.",
-		handler: async (_args, ctx) => {
-			const options = defaultOptions(ctx) ?? { scope: "chat", relatedOnly: true, ...sessionScope(ctx) };
-			ctx.ui.notify(formatSpendReport(options, ctx), "info");
 		},
 	});
 
