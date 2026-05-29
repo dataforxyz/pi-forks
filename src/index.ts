@@ -1,4 +1,6 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { diagnoseForkRuns, parseSessionTokenFile, scanAgentSpend, scanForkRuns, scanObservationalMemorySpend, sumRunTokens, type AgentSpendSummary, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary, type ObservationalMemorySpendSummary, type TokenUsage } from "./monitor.ts";
 import {
 	cyan,
@@ -191,8 +193,8 @@ function buildSpendStatus(threadTokens: TokenUsage | undefined, agentSpend: Agen
 	}
 	if (memorySpend.visibleTokens.total > 0 || memorySpend.fullTokens.total > 0) {
 		const visible = formatSpend(memorySpend.visibleTokens) ?? `${formatTokens(memorySpend.visibleTokens.total)} tok`;
-		const full = memorySpend.fullTokens.total > memorySpend.visibleTokens.total ? `/${formatSpend(memorySpend.fullTokens) ?? `${formatTokens(memorySpend.fullTokens.total)} tok`}` : "";
-		parts.push(green(`✦ memory ${visible}${full}`));
+		const full = memorySpend.fullTokens.total > memorySpend.visibleTokens.total ? ` · ${formatSpend(memorySpend.fullTokens) ?? `${formatTokens(memorySpend.fullTokens.total)} tok`} full` : "";
+		parts.push(green(`✦ mem ${visible} ctx${full}`));
 	}
 	return parts.length > 0 ? parts.join(" · ") : undefined;
 }
@@ -376,6 +378,33 @@ function modelDisplayName(model: unknown): string | undefined {
 	return id ?? provider;
 }
 
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
+}
+
+function readObservationalMemoryModelConfig(path: string): { provider: string; id: string } | undefined {
+	if (!existsSync(path)) return undefined;
+	try {
+		const root = recordValue(JSON.parse(readFileSync(path, "utf8")));
+		const settings = recordValue(root?.["observational-memory"]);
+		const model = recordValue(settings?.model);
+		const provider = typeof model?.provider === "string" ? model.provider : undefined;
+		const id = typeof model?.id === "string" ? model.id : undefined;
+		return provider && id ? { provider, id } : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function resolveObservationalMemoryModel(ctx: ExtensionContext | undefined): unknown {
+	if (!ctx) return undefined;
+	const globalModel = readObservationalMemoryModelConfig(join(getAgentDir(), "settings.json"));
+	const projectModel = readObservationalMemoryModelConfig(join(ctx.cwd, ".pi", "settings.json"));
+	const configured = projectModel ?? globalModel;
+	if (configured) return ctx.modelRegistry.find(configured.provider, configured.id) ?? ctx.model;
+	return ctx.model;
+}
+
 function estimateInputCost(tokens: TokenUsage, inputCostPerMillion: number | undefined): TokenUsage {
 	if (!inputCostPerMillion || tokens.total <= 0) return tokens;
 	return { ...tokens, cost: (inputCostPerMillion / 1_000_000) * tokens.total };
@@ -392,12 +421,13 @@ function withMemoryInputCost(memorySpend: ObservationalMemorySpendSummary, model
 
 function currentSpend(options: ViewOptions, ctx?: ExtensionContext): SpendSnapshot {
 	const rawMemorySpend = scanObservationalMemorySpend(currentBranchEntries(ctx));
+	const memoryModel = resolveObservationalMemoryModel(ctx);
 	return {
 		threadTokens: parseSessionTokenFile(options.parentSessionFile),
 		agentSpend: scanAgentSpend({ parentSessionFile: options.parentSessionFile }),
 		forkSummary: summarize({ ...options, includeCompleted: true, relatedOnly: true }),
-		memorySpend: withMemoryInputCost(rawMemorySpend, ctx?.model),
-		memoryPricingModel: modelInputCostPerMillion(ctx?.model) ? modelDisplayName(ctx?.model) : undefined,
+		memorySpend: withMemoryInputCost(rawMemorySpend, memoryModel),
+		memoryPricingModel: modelInputCostPerMillion(memoryModel) ? modelDisplayName(memoryModel) : undefined,
 	};
 }
 
