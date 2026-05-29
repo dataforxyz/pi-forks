@@ -36,6 +36,14 @@ let lastSpendStatus: string | undefined;
 let lastSpendStatusAt = 0;
 let lastSpendScopeKey: string | undefined;
 
+type SpendSnapshot = {
+	threadTokens?: TokenUsage;
+	agentSpend: AgentSpendSummary;
+	forkSummary: ForkSummary;
+	memorySpend: ObservationalMemorySpendSummary;
+	memoryPricingModel?: string;
+};
+
 function configuredSource(): ForkSource | undefined {
 	const raw = process.env.PI_FORKS_SOURCE;
 	return SOURCES.includes(raw as ForkSource) ? raw as ForkSource : undefined;
@@ -182,9 +190,9 @@ function buildSpendStatus(threadTokens: TokenUsage | undefined, agentSpend: Agen
 		parts.push(orange(`↯ ${runLabel} ${forks}`));
 	}
 	if (memorySpend.visibleTokens.total > 0 || memorySpend.fullTokens.total > 0) {
-		const visible = formatTokens(memorySpend.visibleTokens.total);
-		const full = memorySpend.fullTokens.total > memorySpend.visibleTokens.total ? `/${formatTokens(memorySpend.fullTokens.total)}` : "";
-		parts.push(green(`✦ memory ${visible}${full} tok`));
+		const visible = formatSpend(memorySpend.visibleTokens) ?? `${formatTokens(memorySpend.visibleTokens.total)} tok`;
+		const full = memorySpend.fullTokens.total > memorySpend.visibleTokens.total ? `/${formatSpend(memorySpend.fullTokens) ?? `${formatTokens(memorySpend.fullTokens.total)} tok`}` : "";
+		parts.push(green(`✦ memory ${visible}${full}`));
 	}
 	return parts.length > 0 ? parts.join(" · ") : undefined;
 }
@@ -353,12 +361,43 @@ function currentBranchEntries(ctx: ExtensionContext | undefined): unknown[] {
 	}
 }
 
-function currentSpend(options: ViewOptions, ctx?: ExtensionContext): { threadTokens?: TokenUsage; agentSpend: AgentSpendSummary; forkSummary: ForkSummary; memorySpend: ObservationalMemorySpendSummary } {
+function modelInputCostPerMillion(model: unknown): number | undefined {
+	const record = typeof model === "object" && model !== null ? model as Record<string, unknown> : undefined;
+	const cost = typeof record?.cost === "object" && record.cost !== null ? record.cost as Record<string, unknown> : undefined;
+	const input = cost?.input;
+	return typeof input === "number" && Number.isFinite(input) && input > 0 ? input : undefined;
+}
+
+function modelDisplayName(model: unknown): string | undefined {
+	const record = typeof model === "object" && model !== null ? model as Record<string, unknown> : undefined;
+	const provider = typeof record?.provider === "string" ? record.provider : undefined;
+	const id = typeof record?.id === "string" ? record.id : undefined;
+	if (provider && id) return `${provider}/${id}`;
+	return id ?? provider;
+}
+
+function estimateInputCost(tokens: TokenUsage, inputCostPerMillion: number | undefined): TokenUsage {
+	if (!inputCostPerMillion || tokens.total <= 0) return tokens;
+	return { ...tokens, cost: (inputCostPerMillion / 1_000_000) * tokens.total };
+}
+
+function withMemoryInputCost(memorySpend: ObservationalMemorySpendSummary, model: unknown): ObservationalMemorySpendSummary {
+	const inputCostPerMillion = modelInputCostPerMillion(model);
+	return {
+		...memorySpend,
+		visibleTokens: estimateInputCost(memorySpend.visibleTokens, inputCostPerMillion),
+		fullTokens: estimateInputCost(memorySpend.fullTokens, inputCostPerMillion),
+	};
+}
+
+function currentSpend(options: ViewOptions, ctx?: ExtensionContext): SpendSnapshot {
+	const rawMemorySpend = scanObservationalMemorySpend(currentBranchEntries(ctx));
 	return {
 		threadTokens: parseSessionTokenFile(options.parentSessionFile),
 		agentSpend: scanAgentSpend({ parentSessionFile: options.parentSessionFile }),
 		forkSummary: summarize({ ...options, includeCompleted: true, relatedOnly: true }),
-		memorySpend: scanObservationalMemorySpend(currentBranchEntries(ctx)),
+		memorySpend: withMemoryInputCost(rawMemorySpend, ctx?.model),
+		memoryPricingModel: modelInputCostPerMillion(ctx?.model) ? modelDisplayName(ctx?.model) : undefined,
 	};
 }
 
@@ -378,10 +417,11 @@ function formatSpendLine(label: string, tokens: TokenUsage | undefined, extra?: 
 	return `${label}: ${spend}${extra ? ` · ${extra}` : ""}`;
 }
 
-function formatMemorySpendLine(memory: ObservationalMemorySpendSummary): string {
+function formatMemorySpendLine(memory: ObservationalMemorySpendSummary, pricingModel?: string): string {
 	const visible = formatSpend(memory.visibleTokens) ?? "0 tok";
 	const full = formatSpend(memory.fullTokens) ?? "0 tok";
-	return `memory: ${visible} visible context · ${full} full active (${memory.visibleObservations} obs/${memory.visibleReflections} refl visible · ${memory.fullObservations} obs/${memory.fullReflections} refl active${memory.droppedObservations ? ` · ${memory.droppedObservations} dropped` : ""})`;
+	const pricedAs = pricingModel ? ` · priced as ${pricingModel} input` : "";
+	return `memory: ${visible} visible context · ${full} full active (${memory.visibleObservations} obs/${memory.visibleReflections} refl visible · ${memory.fullObservations} obs/${memory.fullReflections} refl active${memory.droppedObservations ? ` · ${memory.droppedObservations} dropped` : ""}${pricedAs})`;
 }
 
 function formatSpendReport(options: ViewOptions, ctx?: ExtensionContext): string {
@@ -390,7 +430,7 @@ function formatSpendReport(options: ViewOptions, ctx?: ExtensionContext): string
 	lines.push(formatSpendLine("dialog", spend.threadTokens));
 	lines.push(formatSpendLine("agents", spend.agentSpend.totalTokens, `${spend.agentSpend.runs.length} runs · ${spend.agentSpend.steps} steps${spend.agentSpend.active.length ? ` · ${spend.agentSpend.active.length} active` : ""}`));
 	lines.push(formatSpendLine("forks", spend.forkSummary.totalTokens, `${spend.forkSummary.runs.length} related runs${spend.forkSummary.running.length || spend.forkSummary.stale.length ? ` · ${spend.forkSummary.running.length} running · ${spend.forkSummary.stale.length} stale` : ""}`));
-	lines.push(formatMemorySpendLine(spend.memorySpend));
+	lines.push(formatMemorySpendLine(spend.memorySpend, spend.memoryPricingModel));
 	return lines.join("\n");
 }
 
