@@ -127,6 +127,16 @@ export interface AgentSpendSummary {
 	totalCost?: number;
 }
 
+export interface ObservationalMemorySpendSummary {
+	visibleTokens: TokenUsage;
+	fullTokens: TokenUsage;
+	visibleObservations: number;
+	visibleReflections: number;
+	fullObservations: number;
+	fullReflections: number;
+	droppedObservations: number;
+}
+
 export interface AgentSpendOptions {
 	parentSessionFile?: string;
 	rootDir?: string;
@@ -584,6 +594,105 @@ export function sumRunTokens(runs: Array<{ tokens?: TokenUsage }>): TokenUsage {
 	const acc = emptyTokens();
 	for (const run of runs) addTokenUsage(acc, run.tokens);
 	return finalizeTokens(acc);
+}
+
+const OM_OBSERVATIONS_RECORDED = "om.observations.recorded";
+const OM_REFLECTIONS_RECORDED = "om.reflections.recorded";
+const OM_OBSERVATIONS_DROPPED = "om.observations.dropped";
+const OM_FOLDED = "om.folded";
+
+type MemoryItem = { id: string; tokenCount: number };
+type MemoryProjection = { observations: MemoryItem[]; reflections: MemoryItem[] };
+
+function tokenUsageFromCount(total: number): TokenUsage {
+	return { input: total, output: 0, total };
+}
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+	return typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
+}
+
+function memoryItems(value: unknown): MemoryItem[] {
+	if (!Array.isArray(value)) return [];
+	const items: MemoryItem[] = [];
+	for (const candidate of value) {
+		const item = objectValue(candidate);
+		if (!item) continue;
+		const id = stringValue(item.id);
+		const tokenCount = numberValue(item.tokenCount);
+		if (!id || tokenCount === undefined || tokenCount < 0) continue;
+		items.push({ id, tokenCount });
+	}
+	return items;
+}
+
+function memoryProjectionFromDetails(details: unknown): MemoryProjection | undefined {
+	const record = objectValue(details);
+	if (!record || record.type !== OM_FOLDED) return undefined;
+	return {
+		observations: memoryItems(record.observations),
+		reflections: memoryItems(record.reflections),
+	};
+}
+
+function latestVisibleMemoryProjection(entries: unknown[]): MemoryProjection {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = objectValue(entries[index]);
+		if (!entry || entry.type !== "compaction") continue;
+		const projection = memoryProjectionFromDetails(entry.details);
+		if (projection) return projection;
+	}
+	return { observations: [], reflections: [] };
+}
+
+function sumMemoryTokens(projection: MemoryProjection): number {
+	return [...projection.observations, ...projection.reflections].reduce((total, item) => total + item.tokenCount, 0);
+}
+
+export function scanObservationalMemorySpend(entries: unknown[] | undefined): ObservationalMemorySpendSummary {
+	const branch = entries ?? [];
+	const observationsById = new Map<string, MemoryItem>();
+	const reflectionsById = new Map<string, MemoryItem>();
+	const droppedObservationIds = new Set<string>();
+
+	for (const rawEntry of branch) {
+		const entry = objectValue(rawEntry);
+		if (!entry || entry.type !== "custom") continue;
+		const data = objectValue(entry.data);
+		if (!data) continue;
+		if (entry.customType === OM_OBSERVATIONS_RECORDED) {
+			for (const observation of memoryItems(data.observations)) {
+				if (!observationsById.has(observation.id)) observationsById.set(observation.id, observation);
+			}
+			continue;
+		}
+		if (entry.customType === OM_REFLECTIONS_RECORDED) {
+			for (const reflection of memoryItems(data.reflections)) {
+				if (!reflectionsById.has(reflection.id)) reflectionsById.set(reflection.id, reflection);
+			}
+			continue;
+		}
+		if (entry.customType === OM_OBSERVATIONS_DROPPED && Array.isArray(data.observationIds)) {
+			for (const observationId of data.observationIds) {
+				if (typeof observationId === "string" && observationId.length > 0) droppedObservationIds.add(observationId);
+			}
+		}
+	}
+
+	const full: MemoryProjection = {
+		observations: [...observationsById.values()].filter((observation) => !droppedObservationIds.has(observation.id)),
+		reflections: [...reflectionsById.values()],
+	};
+	const visible = latestVisibleMemoryProjection(branch);
+	return {
+		visibleTokens: tokenUsageFromCount(sumMemoryTokens(visible)),
+		fullTokens: tokenUsageFromCount(sumMemoryTokens(full)),
+		visibleObservations: visible.observations.length,
+		visibleReflections: visible.reflections.length,
+		fullObservations: full.observations.length,
+		fullReflections: full.reflections.length,
+		droppedObservations: droppedObservationIds.size,
+	};
 }
 
 function tokensFromAttempts(attempts: unknown): TokenUsage {

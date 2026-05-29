@@ -1,11 +1,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { diagnoseForkRuns, parseSessionTokenFile, scanAgentSpend, scanForkRuns, sumRunTokens, type AgentSpendSummary, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary, type TokenUsage } from "./monitor.ts";
+import { diagnoseForkRuns, parseSessionTokenFile, scanAgentSpend, scanForkRuns, scanObservationalMemorySpend, sumRunTokens, type AgentSpendSummary, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary, type ObservationalMemorySpendSummary, type TokenUsage } from "./monitor.ts";
 import {
 	cyan,
 	formatDuration,
 	formatSpend,
 	formatTokens,
 	forkIcon,
+	green,
 	orange,
 	runStats,
 	statusColor,
@@ -165,7 +166,7 @@ function buildStatus(summary: ForkSummary, _options: ViewOptions, theme?: ThemeL
 	return `${icon} ${count} · ${hint}`;
 }
 
-function buildSpendStatus(threadTokens: TokenUsage | undefined, agentSpend: AgentSpendSummary, forkSummary: ForkSummary): string | undefined {
+function buildSpendStatus(threadTokens: TokenUsage | undefined, agentSpend: AgentSpendSummary, forkSummary: ForkSummary, memorySpend: ObservationalMemorySpendSummary): string | undefined {
 	const parts: string[] = [];
 	const thread = formatSpend(threadTokens);
 	if (thread) parts.push(cyan(`◉ dialog ${thread}`));
@@ -179,6 +180,11 @@ function buildSpendStatus(threadTokens: TokenUsage | undefined, agentSpend: Agen
 		const runCount = forkSummary.runs.filter((run) => (run.tokens?.total ?? 0) > 0).length;
 		const runLabel = runCount === 1 ? "fork" : "forks";
 		parts.push(orange(`↯ ${runLabel} ${forks}`));
+	}
+	if (memorySpend.visibleTokens.total > 0 || memorySpend.fullTokens.total > 0) {
+		const visible = formatTokens(memorySpend.visibleTokens.total);
+		const full = memorySpend.fullTokens.total > memorySpend.visibleTokens.total ? `/${formatTokens(memorySpend.fullTokens.total)}` : "";
+		parts.push(green(`✦ memory ${visible}${full} tok`));
 	}
 	return parts.length > 0 ? parts.join(" · ") : undefined;
 }
@@ -339,19 +345,28 @@ function spendScopeKey(options: ViewOptions): string {
 	});
 }
 
-function currentSpend(options: ViewOptions): { threadTokens?: TokenUsage; agentSpend: AgentSpendSummary; forkSummary: ForkSummary } {
+function currentBranchEntries(ctx: ExtensionContext | undefined): unknown[] {
+	try {
+		return (ctx?.sessionManager.getBranch() as unknown[] | undefined) ?? [];
+	} catch {
+		return [];
+	}
+}
+
+function currentSpend(options: ViewOptions, ctx?: ExtensionContext): { threadTokens?: TokenUsage; agentSpend: AgentSpendSummary; forkSummary: ForkSummary; memorySpend: ObservationalMemorySpendSummary } {
 	return {
 		threadTokens: parseSessionTokenFile(options.parentSessionFile),
 		agentSpend: scanAgentSpend({ parentSessionFile: options.parentSessionFile }),
 		forkSummary: summarize({ ...options, includeCompleted: true, relatedOnly: true }),
+		memorySpend: scanObservationalMemorySpend(currentBranchEntries(ctx)),
 	};
 }
 
 function updateSpendStatus(ctx: ExtensionContext, options: ViewOptions, now = Date.now()): void {
 	const scopeKey = spendScopeKey(options);
 	if (scopeKey !== lastSpendScopeKey || now - lastSpendStatusAt >= TOKEN_REFRESH_MS) {
-		const spend = currentSpend(options);
-		lastSpendStatus = buildSpendStatus(spend.threadTokens, spend.agentSpend, spend.forkSummary);
+		const spend = currentSpend(options, ctx);
+		lastSpendStatus = buildSpendStatus(spend.threadTokens, spend.agentSpend, spend.forkSummary, spend.memorySpend);
 		lastSpendStatusAt = now;
 		lastSpendScopeKey = scopeKey;
 	}
@@ -363,12 +378,19 @@ function formatSpendLine(label: string, tokens: TokenUsage | undefined, extra?: 
 	return `${label}: ${spend}${extra ? ` · ${extra}` : ""}`;
 }
 
-function formatSpendReport(options: ViewOptions): string {
-	const spend = currentSpend(options);
+function formatMemorySpendLine(memory: ObservationalMemorySpendSummary): string {
+	const visible = formatSpend(memory.visibleTokens) ?? "0 tok";
+	const full = formatSpend(memory.fullTokens) ?? "0 tok";
+	return `memory: ${visible} visible context · ${full} full active (${memory.visibleObservations} obs/${memory.visibleReflections} refl visible · ${memory.fullObservations} obs/${memory.fullReflections} refl active${memory.droppedObservations ? ` · ${memory.droppedObservations} dropped` : ""})`;
+}
+
+function formatSpendReport(options: ViewOptions, ctx?: ExtensionContext): string {
+	const spend = currentSpend(options, ctx);
 	const lines = ["Pi spend for this dialog"];
 	lines.push(formatSpendLine("dialog", spend.threadTokens));
 	lines.push(formatSpendLine("agents", spend.agentSpend.totalTokens, `${spend.agentSpend.runs.length} runs · ${spend.agentSpend.steps} steps${spend.agentSpend.active.length ? ` · ${spend.agentSpend.active.length} active` : ""}`));
 	lines.push(formatSpendLine("forks", spend.forkSummary.totalTokens, `${spend.forkSummary.runs.length} related runs${spend.forkSummary.running.length || spend.forkSummary.stale.length ? ` · ${spend.forkSummary.running.length} running · ${spend.forkSummary.stale.length} stale` : ""}`));
+	lines.push(formatMemorySpendLine(spend.memorySpend));
 	return lines.join("\n");
 }
 
@@ -477,10 +499,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("pi-spend", {
-		description: "Show this dialog's token/cost split across dialog, agents, and fork handlers.",
+		description: "Show this dialog's token/cost split across dialog, agents, fork handlers, and observational memory.",
 		handler: async (_args, ctx) => {
 			const options = defaultOptions(ctx) ?? { scope: "chat", relatedOnly: true, ...sessionScope(ctx) };
-			ctx.ui.notify(formatSpendReport(options), "info");
+			ctx.ui.notify(formatSpendReport(options, ctx), "info");
 		},
 	});
 
@@ -488,7 +510,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Alias for /pi-spend.",
 		handler: async (_args, ctx) => {
 			const options = defaultOptions(ctx) ?? { scope: "chat", relatedOnly: true, ...sessionScope(ctx) };
-			ctx.ui.notify(formatSpendReport(options), "info");
+			ctx.ui.notify(formatSpendReport(options, ctx), "info");
 		},
 	});
 

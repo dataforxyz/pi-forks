@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { diagnoseForkRuns, parseSessionTokens, scanAgentSpend, scanForkRuns } from "../src/monitor.ts";
+import { diagnoseForkRuns, parseSessionTokens, scanAgentSpend, scanForkRuns, scanObservationalMemorySpend } from "../src/monitor.ts";
 
 function makeHome(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-forks-test-"));
@@ -148,6 +148,25 @@ test("diagnoseForkRuns reports stale records and duplicate active cwd groups", (
 	assert.equal(diagnostics.totals.running, 1);
 	assert.ok(diagnostics.issues.some((issue) => issue.kind === "stale_pid" && issue.runIds.includes("icfh_dead")));
 	assert.ok(diagnostics.issues.some((issue) => issue.kind === "duplicate_active_cwd" && issue.cwd === cwd));
+});
+
+test("scanObservationalMemorySpend reports visible and full memory token footprint", () => {
+	const entries = [
+		{ type: "custom", customType: "om.observations.recorded", data: { observations: [{ id: "obs-a", tokenCount: 100 }, { id: "obs-b", tokenCount: 250 }] } },
+		{ type: "custom", customType: "om.reflections.recorded", data: { reflections: [{ id: "ref-a", tokenCount: 75 }] } },
+		{ type: "compaction", details: { type: "om.folded", version: 1, observations: [{ id: "obs-a", tokenCount: 100 }], reflections: [] } },
+		{ type: "custom", customType: "om.observations.dropped", data: { observationIds: ["obs-a"] } },
+	];
+
+	const spend = scanObservationalMemorySpend(entries);
+
+	assert.equal(spend.visibleTokens.total, 100);
+	assert.equal(spend.fullTokens.total, 325);
+	assert.equal(spend.visibleObservations, 1);
+	assert.equal(spend.visibleReflections, 0);
+	assert.equal(spend.fullObservations, 1);
+	assert.equal(spend.fullReflections, 1);
+	assert.equal(spend.droppedObservations, 1);
 });
 
 test("scanAgentSpend totals async subagent runs for a parent session", () => {

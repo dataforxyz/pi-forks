@@ -52,6 +52,10 @@ export function violet(text: string): string {
 	return ansi256(141, text);
 }
 
+export function green(text: string): string {
+	return ansi256(118, text);
+}
+
 export function truncate(text: string, max: number): string {
 	return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
 }
