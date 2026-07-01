@@ -9,7 +9,7 @@ It gives forks their own UI instead of burying fork telemetry inside `pi-interco
 - Shared runtime helpers for fork handler paths/state, intercom identities, Pi fork args, environment flags, and detached process launch.
 - Source-scoped footer status while forks are running: a green growing fork icon, running count, and `Ctrl+Alt+F` shortcut hint.
 - A small, color-coded modal for fork details: source extension, status, label, duration, and token usage by default.
-- `Ctrl+Alt+F` or `/forks` opens the current chat by default. The modal has toggles for `t` related-only, `c` completed, `s` sort mode, and `v` reverse sort; press `a` to cycle scopes: this chat, response handlers, subagents, user forks, all forks. Close with `Esc` or `q`.
+- `Ctrl+Alt+F` or `/forks` opens the current chat by default. The modal has toggles for `t` related-only, `c` completed, `s` sort mode, and `v` reverse sort; press `a` to cycle scopes: this chat, response handlers, subagents, user forks, all forks. Press capital `X` to stop the selected running fork handler. Close with `Esc` or `q`.
 - `/forks <source> --all` to include completed, failed, and unknown handlers for that source.
 - `/forks --all-sources` for the intentional global view.
 - `/forks --health` or `/forks-health` for a text diagnostic report covering stale dead-PID records, failed/unknown handlers, duplicate active handlers in the same cwd, and token totals.
@@ -62,6 +62,34 @@ pi install .
 ```
 
 Or add it to Pi settings as a local package/extension during development.
+
+## Audit and observation
+
+For terminal audits outside the TUI, use the packaged audit script:
+
+```bash
+npm run audit -- --all --limit 100 --run-limit 100
+npm --silent run audit:json -- --all > forks-audit.json
+```
+
+The audit report shows:
+
+- state roots and source handler files being inspected;
+- active/recent fork handlers, their source, status, PID, parent target, and activation time;
+- shared background-events DB health, slots, queue depth, attached updates, results, and lineage budgets;
+- recent deterministic transition audit rows (`handler-starting`, `attached-to-handler`, `queued`, completion, launch failure, and reconciler transitions);
+- health issues such as stale PIDs, failed handlers, duplicate active cwd groups, and high incomplete spend.
+
+Useful options:
+
+```text
+--all / --completed       include completed handlers in the run list
+--source intercom         limit source view to intercom, return_on, or subagents
+--limit 200              increase DB timeline rows
+--run-limit 200          increase text handler/run rows
+--json                   machine-readable report
+--db /path/to/db         inspect an isolated/background test DB
+```
 
 ## Commands
 

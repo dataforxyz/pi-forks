@@ -13,6 +13,7 @@
   ],
   "files": [
     "src/**/*.ts",
+    "scripts/**/*.ts",
     "README.md",
     "CHANGELOG.md"
   ],
@@ -26,6 +27,8 @@
     "./src/background-supervisor.ts": "./src/background-supervisor.ts"
   },
   "scripts": {
+    "audit": "node --experimental-strip-types scripts/audit-forks.ts",
+    "audit:json": "node --experimental-strip-types scripts/audit-forks.ts --json",
     "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "pi": {
