@@ -13,8 +13,8 @@ import {
 	type ThemeLike,
 } from "./formatting.ts";
 import { BackgroundEventsStore } from "./background-events.ts";
-import { ForksModal, SORT_ORDER, type ModalDeps, type SortMode, type StopForkResult, type ViewOptions, type ViewScope } from "./modal.ts";
-import { getForkHandlersFile, isProcessAlive, sourceColor, sourceLabel, writeJsonAtomic } from "./runtime.ts";
+import { ForksModal, SORT_ORDER, type ForkControlAction, type ModalDeps, type SortMode, type StopForkResult, type ViewOptions, type ViewScope } from "./modal.ts";
+import { getForkHandlerIdentity, getForkHandlersFile, isProcessAlive, sourceColor, sourceLabel, writeJsonAtomic } from "./runtime.ts";
 
 const EXTENSION_KEY = "pi-forks";
 const WIDGET_KEY = "pi-forks";
@@ -252,11 +252,11 @@ interface SourceHandlerState {
 	handlers?: Array<Record<string, unknown>>;
 }
 
-function signalForkPid(pid: number | undefined): "none" | "signalled" | "not-found" | "permission-denied" {
+function signalForkPid(pid: number | undefined, signal: NodeJS.Signals): "none" | "signalled" | "not-found" | "permission-denied" {
 	if (!pid || !Number.isInteger(pid) || pid <= 0) return "none";
 	let attempted = false;
 	try {
-		process.kill(-pid, "SIGTERM");
+		process.kill(-pid, signal);
 		return "signalled";
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
@@ -266,7 +266,7 @@ function signalForkPid(pid: number | undefined): "none" | "signalled" | "not-fou
 	}
 	try {
 		attempted = true;
-		process.kill(pid, "SIGTERM");
+		process.kill(pid, signal);
 		return "signalled";
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
@@ -316,18 +316,41 @@ function markBackgroundEventHandlerStopped(run: ForkRun): void {
 	}
 }
 
-async function stopForkRun(run: ForkRun): Promise<StopForkResult> {
-	if (run.status === "complete" || run.status === "failed") {
-		return { ok: false, message: `${run.label} is already ${run.status}.` };
+function currentSessionIsForkHandler(): boolean {
+	return !!getForkHandlerIdentity(process.env);
+}
+
+function canControlRun(run: ForkRun, ctx = latestCtx): StopForkResult | undefined {
+	if (currentSessionIsForkHandler()) return { ok: false, message: "Fork handler sessions may inspect forks, but only the parent/main dialog can pause, resume, or stop fork handlers." };
+	const scope = sessionScope(ctx);
+	if (Object.keys(scope).length > 0 && !runMatchesCurrentSession(run, scope)) return { ok: false, message: `Refusing to control ${run.label}; it is not owned by this main dialog/session.` };
+	return undefined;
+}
+
+async function controlForkRun(run: ForkRun, action: ForkControlAction, ctx = latestCtx): Promise<StopForkResult> {
+	const denied = canControlRun(run, ctx);
+	if (denied) return denied;
+	if ((action === "stop" && (run.status === "complete" || run.status === "failed")) || (action !== "stop" && run.status !== "running")) {
+		return { ok: false, message: `${run.label} is ${run.status}; only running handlers can be ${action === "stop" ? "stopped" : action === "pause" ? "paused" : "resumed"}.` };
 	}
+	const signal = action === "stop" ? "SIGTERM" : action === "pause" ? "SIGSTOP" : "SIGCONT";
 	const alive = isProcessAlive(run.pid);
-	const signalResult = signalForkPid(run.pid);
-	const changed = await markSourceHandlerStopped(run);
-	markBackgroundEventHandlerStopped(run);
-	if (signalResult === "permission-denied") return { ok: false, message: `No permission to stop ${run.label} (pid ${run.pid}).` };
-	if (signalResult === "signalled") return { ok: true, message: `Sent SIGTERM to ${run.label}${run.pid ? ` (pid ${run.pid})` : ""}.` };
-	if (changed) return { ok: true, message: `Marked ${run.label} stopped; no live pid was found${alive === false ? "" : "."}` };
-	return { ok: false, message: `Could not stop ${run.label}; no live pid or handler record was found.` };
+	const signalResult = signalForkPid(run.pid, signal);
+	if (action === "stop") {
+		const changed = await markSourceHandlerStopped(run);
+		markBackgroundEventHandlerStopped(run);
+		if (signalResult === "permission-denied") return { ok: false, message: `No permission to stop ${run.label} (pid ${run.pid}).` };
+		if (signalResult === "signalled") return { ok: true, message: `Sent SIGTERM to ${run.label}${run.pid ? ` (pid ${run.pid})` : ""}.` };
+		if (changed) return { ok: true, message: `Marked ${run.label} stopped; no live pid was found${alive === false ? "" : "."}` };
+		return { ok: false, message: `Could not stop ${run.label}; no live pid or handler record was found.` };
+	}
+	if (signalResult === "permission-denied") return { ok: false, message: `No permission to ${action} ${run.label} (pid ${run.pid}).` };
+	if (signalResult === "signalled") return { ok: true, message: `Sent ${signal} to ${run.label}${run.pid ? ` (pid ${run.pid})` : ""}.` };
+	return { ok: false, message: `Could not ${action} ${run.label}; no live pid was found.` };
+}
+
+async function stopForkRun(run: ForkRun): Promise<StopForkResult> {
+	return controlForkRun(run, "stop");
 }
 
 const MODAL_DEPS: ModalDeps = {
@@ -335,6 +358,7 @@ const MODAL_DEPS: ModalDeps = {
 	scopeLabel,
 	sourceLabel,
 	sourceColor,
+	controlRun: controlForkRun,
 	stopRun: stopForkRun,
 	requestRender: () => latestCtx?.ui.requestRender?.(),
 	shortcut: FORKS_SHORTCUT,
@@ -438,7 +462,97 @@ async function notifyScoped(ctx: ExtensionContext, source: ForkSource, includeCo
 	await showForksModal(ctx, { source, includeCompleted });
 }
 
+interface ForksToolParams {
+	action?: "list" | "audit" | ForkControlAction;
+	id?: string;
+	source?: ForkSource;
+	includeCompleted?: boolean;
+	all?: boolean;
+	limit?: number;
+}
+
+function resolveForkTarget(id: string | undefined, source: ForkSource | undefined, ctx = latestCtx): { run?: ForkRun; error?: string } {
+	const needle = id?.trim();
+	if (!needle) return { error: "Provide a fork handler id or unambiguous id prefix." };
+	const runs = scanForkRuns({ includeCompleted: true, ...(source ? { source } : {}) }).runs;
+	const exact = runs.filter((run) => run.id === needle);
+	const candidates = exact.length > 0 ? exact : runs.filter((run) => run.id.startsWith(needle));
+	if (candidates.length === 0) return { error: `No fork handler matched ${needle}${source ? ` in ${source}` : ""}.` };
+	if (candidates.length > 1) return { error: `Fork handler id ${needle} is ambiguous: ${candidates.slice(0, 8).map((run) => `${run.source}/${run.id}`).join(", ")}${candidates.length > 8 ? ", …" : ""}` };
+	return { run: candidates[0] };
+}
+
+function formatAgentForkList(options: ViewOptions, limit: number): string {
+	const summary = summarize(options);
+	const rows = summary.runs.slice(0, limit).map((run) => formatRunLine(run));
+	const omitted = summary.runs.length > rows.length ? [`… ${summary.runs.length - rows.length} more omitted; increase limit or use action='audit'.`] : [];
+	const guidance = currentSessionIsForkHandler()
+		? "This session is itself a fork handler: inspect only. Pause/resume/stop are reserved for the parent/main dialog."
+		: "Parent/main dialog controls: action='pause', action='resume', or action='stop' with a handler id. Start new background work with the source tools (subagent async/background, return_on fork delivery, or intercom delegation); pi-forks observes and controls those forks.";
+	const handlerSection = rows.length > 0 ? ["", "Handler ids:", ...rows, ...omitted] : [];
+	return [formatCommandOutput(summary, options), "", guidance, ...handlerSection].join("\n");
+}
+
+async function runForkControlAction(action: ForkControlAction, id: string | undefined, source: ForkSource | undefined, ctx = latestCtx): Promise<StopForkResult> {
+	const resolved = resolveForkTarget(id, source, ctx);
+	if (!resolved.run) return { ok: false, message: resolved.error ?? "No fork handler selected." };
+	return controlForkRun(resolved.run, action, ctx);
+}
+
+async function handleControlCommand(action: ForkControlAction, args: string, ctx: ExtensionContext): Promise<void> {
+	latestCtx = ctx;
+	const parts = args.trim().split(/\s+/).filter(Boolean);
+	const source = SOURCES.includes(parts[0] as ForkSource) ? parts.shift() as ForkSource : undefined;
+	const id = parts[0];
+	const result = await runForkControlAction(action, id, source, ctx);
+	ctx.ui.notify(result.message, result.ok ? "success" : "warning");
+	render(ctx);
+}
+
+function registerForksTool(pi: ExtensionAPI): void {
+	pi.registerTool?.({
+		name: "forks",
+		label: "Forks",
+		description: "Inspect and control background fork handlers owned by the current/main Pi dialog.",
+		promptSnippet: "List, audit, pause, resume, or stop this dialog's background fork handlers.",
+		promptGuidelines: [
+			"Use forks action='list' to see background fork handlers running for the current/main dialog before starting more background work.",
+			"Use forks action='pause', action='resume', or action='stop' with a handler id only for fork handlers owned by this main dialog; fork handler sessions are denied these control actions.",
+			"Use source tools such as subagent async/background, return_on fork delivery, or intercom delegation to start new fork work; pi-forks observes and controls those source-owned forks rather than spawning arbitrary work itself.",
+		],
+		parameters: {
+			type: "object",
+			properties: {
+				action: { type: "string", enum: ["list", "audit", "pause", "resume", "stop"], description: "Operation to perform." },
+				id: { type: "string", description: "Fork handler id or unambiguous id prefix for pause/resume/stop." },
+				source: { type: "string", enum: SOURCES, description: "Optional source filter." },
+				includeCompleted: { type: "boolean", description: "Include completed/failed/unknown handlers in list output." },
+				all: { type: "boolean", description: "List/audit all sources instead of only handlers related to this chat." },
+				limit: { type: "number", description: "Maximum handler rows to show in list output." },
+			},
+			required: ["action"],
+			additionalProperties: false,
+		},
+		async execute(_toolCallId: string, params: ForksToolParams) {
+			const action = params.action ?? "list";
+			const limit = Math.max(1, Math.min(200, Number.isFinite(params.limit) ? Math.floor(params.limit ?? 25) : 25));
+			if (action === "pause" || action === "resume" || action === "stop") {
+				const result = await runForkControlAction(action, params.id, params.source, latestCtx);
+				return { content: [{ type: "text", text: result.message }], details: result };
+			}
+			const base = params.all ? { scope: "all" as const, allSources: true, relatedOnly: false } : defaultOptions(latestCtx) ?? { scope: "chat" as const, relatedOnly: true };
+			const options = { ...base, includeCompleted: !!params.includeCompleted, ...(params.source && !params.all ? { source: params.source } : {}) } satisfies ViewOptions;
+			const text = action === "audit"
+				? formatDiagnostics(diagnoseForkRuns({ includeCompleted: true, ...(params.source ? { source: params.source } : {}) }), { ...options, includeCompleted: true, allSources: params.all ?? !params.source })
+				: formatAgentForkList(options, limit);
+			return { content: [{ type: "text", text }], details: { action, options } };
+		},
+	});
+}
+
 export default function (pi: ExtensionAPI) {
+	registerForksTool(pi);
+
 	pi.on("session_start", async (_event, ctx) => {
 		latestCtx = ctx;
 		render(ctx);
@@ -489,6 +603,21 @@ export default function (pi: ExtensionAPI) {
 			}
 			await showForksModal(ctx, options);
 		},
+	});
+
+	pi.registerCommand("forks-pause", {
+		description: "Pause one of this main dialog's running fork handlers by id or id prefix. Usage: /forks-pause [source] <id>",
+		handler: async (args, ctx) => handleControlCommand("pause", args, ctx),
+	});
+
+	pi.registerCommand("forks-resume", {
+		description: "Resume one of this main dialog's paused fork handlers by id or id prefix. Usage: /forks-resume [source] <id>",
+		handler: async (args, ctx) => handleControlCommand("resume", args, ctx),
+	});
+
+	pi.registerCommand("forks-stop", {
+		description: "Stop one of this main dialog's fork handlers by id or id prefix. Usage: /forks-stop [source] <id>",
+		handler: async (args, ctx) => handleControlCommand("stop", args, ctx),
 	});
 
 	pi.registerCommand("forks-health", {
