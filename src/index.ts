@@ -300,6 +300,61 @@ async function markSourceHandlerStopped(run: ForkRun, now = Date.now()): Promise
 	return changed;
 }
 
+function readTailLines(filePath: string | undefined, maxLines = 20, maxBytes = 12_000): string[] {
+	if (!filePath) return [];
+	try {
+		const stat = fs.statSync(filePath);
+		if (!stat.isFile() || stat.size === 0) return [];
+		const fd = fs.openSync(filePath, "r");
+		try {
+			const bytes = Math.min(maxBytes, stat.size);
+			const buffer = Buffer.alloc(bytes);
+			fs.readSync(fd, buffer, 0, bytes, stat.size - bytes);
+			return buffer.toString("utf8").split(/\r?\n/).filter((line) => line.length > 0).slice(-maxLines);
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return [];
+	}
+}
+
+function formatOptionalTime(label: string, value: number | undefined): string | undefined {
+	return value ? `${label}: ${new Date(value).toISOString()} (${formatDuration(Math.max(0, Date.now() - value))} ago)` : undefined;
+}
+
+function describeForkRun(run: ForkRun): string[] {
+	const stdoutPath = run.dir ? path.join(run.dir, "stdout.log") : undefined;
+	const stderrPath = run.dir ? path.join(run.dir, "stderr.log") : undefined;
+	const stdout = readTailLines(stdoutPath, 12);
+	const stderr = readTailLines(stderrPath, 8);
+	const lines = [
+		`id: ${run.source}/${run.id}`,
+		`status: ${run.status}${run.rawStatus ? ` (raw ${run.rawStatus})` : ""}${run.pid ? ` · pid ${run.pid}${run.pidAlive === false ? " dead" : ""}` : ""}`,
+		`label: ${run.label}`,
+		formatOptionalTime("started", run.startedAt),
+		formatOptionalTime("updated/ended", run.endedAt),
+		run.durationMs !== undefined ? `duration: ${formatDuration(run.durationMs)}` : undefined,
+		run.cwd ? `cwd: ${run.cwd}` : undefined,
+		run.intercomTarget ? `fork intercom: ${run.intercomTarget}` : undefined,
+		run.parentIntercomTarget ? `parent intercom: ${run.parentIntercomTarget}` : undefined,
+		run.parentSessionName ? `parent session: ${run.parentSessionName}` : undefined,
+		run.parentSessionId ? `parent session id: ${run.parentSessionId}` : undefined,
+		run.detail ? `detail: ${run.detail}` : undefined,
+		run.dir ? `handler dir: ${run.dir}` : undefined,
+		run.sessionDir ? `session dir: ${run.sessionDir}` : undefined,
+		stdoutPath ? `stdout: ${stdoutPath}` : undefined,
+		...(stdout.length > 0 ? ["stdout tail:", ...stdout.map((line) => `  ${line}`)] : ["stdout tail: <empty or unavailable>"]),
+		stderrPath ? `stderr: ${stderrPath}` : undefined,
+		...(stderr.length > 0 ? ["stderr tail:", ...stderr.map((line) => `  ${line}`)] : []),
+	].filter((line): line is string => !!line);
+	return lines;
+}
+
+function inspectForkRun(run: ForkRun): string {
+	return describeForkRun(run).join("\n");
+}
+
 function markBackgroundEventHandlerStopped(run: ForkRun): void {
 	try {
 		const store = new BackgroundEventsStore();
@@ -360,6 +415,7 @@ const MODAL_DEPS: ModalDeps = {
 	sourceColor,
 	controlRun: controlForkRun,
 	stopRun: stopForkRun,
+	describeRun: describeForkRun,
 	requestRender: () => latestCtx?.ui.requestRender?.(),
 	shortcut: FORKS_SHORTCUT,
 	shortcutAlias: FORKS_SHORTCUT_ALIAS,
@@ -463,7 +519,7 @@ async function notifyScoped(ctx: ExtensionContext, source: ForkSource, includeCo
 }
 
 interface ForksToolParams {
-	action?: "list" | "audit" | ForkControlAction;
+	action?: "list" | "audit" | "inspect" | ForkControlAction;
 	id?: string;
 	source?: ForkSource;
 	includeCompleted?: boolean;
@@ -499,14 +555,25 @@ async function runForkControlAction(action: ForkControlAction, id: string | unde
 	return controlForkRun(resolved.run, action, ctx);
 }
 
-async function handleControlCommand(action: ForkControlAction, args: string, ctx: ExtensionContext): Promise<void> {
-	latestCtx = ctx;
+function parseSourceAndId(args: string): { source?: ForkSource; id?: string } {
 	const parts = args.trim().split(/\s+/).filter(Boolean);
 	const source = SOURCES.includes(parts[0] as ForkSource) ? parts.shift() as ForkSource : undefined;
-	const id = parts[0];
+	return { source, id: parts[0] };
+}
+
+async function handleControlCommand(action: ForkControlAction, args: string, ctx: ExtensionContext): Promise<void> {
+	latestCtx = ctx;
+	const { source, id } = parseSourceAndId(args);
 	const result = await runForkControlAction(action, id, source, ctx);
 	ctx.ui.notify(result.message, result.ok ? "success" : "warning");
 	render(ctx);
+}
+
+async function handleInspectCommand(args: string, ctx: ExtensionContext): Promise<void> {
+	latestCtx = ctx;
+	const { source, id } = parseSourceAndId(args);
+	const resolved = resolveForkTarget(id, source, ctx);
+	ctx.ui.notify(resolved.run ? inspectForkRun(resolved.run) : resolved.error ?? "No fork handler selected.", resolved.run ? "info" : "warning");
 }
 
 function registerForksTool(pi: ExtensionAPI): void {
@@ -517,13 +584,14 @@ function registerForksTool(pi: ExtensionAPI): void {
 		promptSnippet: "List, audit, pause, resume, or stop this dialog's background fork handlers.",
 		promptGuidelines: [
 			"Use forks action='list' to see background fork handlers running for the current/main dialog before starting more background work.",
+			"Use forks action='inspect' with a handler id to look at handler metadata and recent stdout/stderr before deciding whether to wait, contact it, pause, resume, or stop it.",
 			"Use forks action='pause', action='resume', or action='stop' with a handler id only for fork handlers owned by this main dialog; fork handler sessions are denied these control actions.",
 			"Use source tools such as subagent async/background, return_on fork delivery, or intercom delegation to start new fork work; pi-forks observes and controls those source-owned forks rather than spawning arbitrary work itself.",
 		],
 		parameters: {
 			type: "object",
 			properties: {
-				action: { type: "string", enum: ["list", "audit", "pause", "resume", "stop"], description: "Operation to perform." },
+				action: { type: "string", enum: ["list", "audit", "inspect", "pause", "resume", "stop"], description: "Operation to perform." },
 				id: { type: "string", description: "Fork handler id or unambiguous id prefix for pause/resume/stop." },
 				source: { type: "string", enum: SOURCES, description: "Optional source filter." },
 				includeCompleted: { type: "boolean", description: "Include completed/failed/unknown handlers in list output." },
@@ -539,6 +607,11 @@ function registerForksTool(pi: ExtensionAPI): void {
 			if (action === "pause" || action === "resume" || action === "stop") {
 				const result = await runForkControlAction(action, params.id, params.source, latestCtx);
 				return { content: [{ type: "text", text: result.message }], details: result };
+			}
+			if (action === "inspect") {
+				const resolved = resolveForkTarget(params.id, params.source, latestCtx);
+				if (!resolved.run) return { content: [{ type: "text", text: resolved.error ?? "No fork handler selected." }], details: { ok: false, error: resolved.error } };
+				return { content: [{ type: "text", text: inspectForkRun(resolved.run) }], details: { ok: true, id: resolved.run.id, source: resolved.run.source } };
 			}
 			const base = params.all ? { scope: "all" as const, allSources: true, relatedOnly: false } : defaultOptions(latestCtx) ?? { scope: "chat" as const, relatedOnly: true };
 			const options = { ...base, includeCompleted: !!params.includeCompleted, ...(params.source && !params.all ? { source: params.source } : {}) } satisfies ViewOptions;
@@ -603,6 +676,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			await showForksModal(ctx, options);
 		},
+	});
+
+	pi.registerCommand("forks-inspect", {
+		description: "Show metadata and stdout/stderr tails for a fork handler. Usage: /forks-inspect [source] <id>",
+		handler: async (args, ctx) => handleInspectCommand(args, ctx),
 	});
 
 	pi.registerCommand("forks-pause", {

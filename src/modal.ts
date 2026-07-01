@@ -47,6 +47,7 @@ export interface ModalDeps {
 	sourceColor: (source: ForkRun["source"]) => string;
 	controlRun?: (run: ForkRun, action: ForkControlAction) => Promise<StopForkResult> | StopForkResult;
 	stopRun?: (run: ForkRun) => Promise<StopForkResult> | StopForkResult;
+	describeRun?: (run: ForkRun) => string[];
 	requestRender?: () => void;
 	shortcut: string;
 	shortcutAlias: string;
@@ -77,6 +78,7 @@ export class ForksModal {
 	private scope: ViewScope | undefined;
 	private sortMode: SortMode;
 	private sortDesc: boolean;
+	private inspecting = false;
 	private cachedLines: string[] | undefined;
 	private statusMessage: StopForkResult | undefined;
 	private controlling: ForkControlAction | undefined;
@@ -126,6 +128,9 @@ export class ForksModal {
 		} else if (data === "r") {
 			this.statusMessage = undefined;
 			this.invalidate();
+		} else if (data === "i" || data === "I" || matchesInput(data, "enter")) {
+			this.inspecting = !this.inspecting;
+			this.invalidate();
 		} else if (data === "X") {
 			void this.controlSelected(summary, "stop");
 		} else if (data === "P") {
@@ -170,7 +175,7 @@ export class ForksModal {
 		const titleCount = globalRunning > summary.running.length ? `${summary.running.length} running/${globalRunning} total` : `${summary.running.length} running`;
 		const title = `${this.theme.fg("success", forkIcon(Math.max(summary.running.length, globalRunning)))} ${this.theme.fg("accent", "fork handlers")} ${this.theme.fg("dim", `${titleCount} · ${summary.runs.length} shown · ${scope}`)}`;
 		const range = body.length > this.deps.bodyLines ? ` · lines ${this.scroll + 1}-${Math.min(body.length, this.scroll + this.deps.bodyLines)}/${body.length}` : "";
-		const help = this.theme.fg("dim", `↑/↓ select · P pause · U resume · X stop · a scope · t related · c completed · s sort · v reverse · Esc/q close${range}`);
+		const help = this.theme.fg("dim", `↑/↓ select · Enter/i inspect · P pause · U resume · X stop · a scope · c completed · Esc/q close${range}`);
 		return [
 			this.theme.fg("muted", this.border("┌", "┐", frameWidth)),
 			this.frameLine(title, frameWidth),
@@ -260,10 +265,21 @@ export class ForksModal {
 		if (summary.runs.length === 0) {
 			push(this.theme.fg("warning", `No fork handlers for ${scope}.`));
 		} else {
-			for (const [index, run] of summary.runs.entries()) push(this.formatRunRow(run, index, innerWidth));
+			for (const [index, run] of summary.runs.entries()) {
+				push(this.formatRunRow(run, index, innerWidth));
+				if (this.inspecting && index === this.selectedIndex) {
+					for (const detail of this.formatRunDetails(run, innerWidth)) push(detail);
+				}
+			}
 		}
 		this.cachedLines = lines;
 		return lines;
+	}
+
+	private formatRunDetails(run: ForkRun, innerWidth: number): string[] {
+		const details = this.deps.describeRun?.(run) ?? [`No inspector available for ${run.id}.`];
+		const width = Math.max(12, innerWidth - 6);
+		return details.map((line) => `${this.theme.fg("muted", "│")} ${this.theme.fg("dim", truncate(line, width))}`);
 	}
 
 	private formatRunRow(run: ForkRun, index: number, innerWidth: number): string {

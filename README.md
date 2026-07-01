@@ -9,7 +9,7 @@ It gives forks their own UI instead of burying fork telemetry inside `pi-interco
 - Shared runtime helpers for fork handler paths/state, intercom identities, Pi fork args, environment flags, and detached process launch.
 - Source-scoped footer status while forks are running: a green growing fork icon, running count, and `Ctrl+Alt+F` shortcut hint.
 - A small, color-coded modal for fork details: source extension, status, label, duration, and token usage by default.
-- `Ctrl+Alt+F` or `/forks` opens the current chat by default. The modal has toggles for `t` related-only, `c` completed, `s` sort mode, and `v` reverse sort; press `a` to cycle scopes: this chat, response handlers, subagents, user forks, all forks. Press capital `P` to pause, `U` to resume, or `X` to stop the selected running fork handler. Close with `Esc` or `q`.
+- `Ctrl+Alt+F` or `/forks` opens the current chat by default. The modal has toggles for `t` related-only, `c` completed, `s` sort mode, and `v` reverse sort; press `a` to cycle scopes: this chat, response handlers, subagents, user forks, all forks. Press `Enter`/`i` to inspect the selected fork's metadata and stdout/stderr tails, capital `P` to pause, `U` to resume, or `X` to stop the selected running fork handler. Close with `Esc` or `q`.
 - `/forks <source> --all` to include completed, failed, and unknown handlers for that source.
 - `/forks --all-sources` for the intentional global view.
 - `/forks --health` or `/forks-health` for a text diagnostic report covering stale dead-PID records, failed/unknown handlers, duplicate active handlers in the same cwd, and token totals.
@@ -70,6 +70,7 @@ Or add it to Pi settings as a local package/extension during development.
 ```json
 { "action": "list" }
 { "action": "audit", "all": true }
+{ "action": "inspect", "id": "icfh_..." }
 { "action": "pause", "id": "icfh_..." }
 { "action": "resume", "id": "icfh_..." }
 { "action": "stop", "id": "icfh_..." }
@@ -80,6 +81,7 @@ Control is intentionally parent-owned: fork handler sessions may inspect with `l
 Command equivalents:
 
 ```text
+/forks-inspect [source] <id-or-prefix>
 /forks-pause [source] <id-or-prefix>
 /forks-resume [source] <id-or-prefix>
 /forks-stop [source] <id-or-prefix>
@@ -128,6 +130,7 @@ Ctrl+Alt+F              open compact fork handlers modal
 /forks --all-sources -a  intentional global view including completed records
 /forks --health          diagnose stale/duplicate/failed fork records
 /forks-health            shorthand health report across all sources
+/forks-inspect <id>      show metadata and stdout/stderr tails for a fork handler
 /forks-pause <id>        pause one of this main dialog's fork handlers
 /forks-resume <id>       resume one of this main dialog's fork handlers
 /forks-stop <id>         stop one of this main dialog's fork handlers
