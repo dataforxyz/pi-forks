@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { diagnoseForkRuns, parseSessionTokens, scanAgentSpend, scanForkRuns, scanObservationalMemorySpend } from "../src/monitor.ts";
+import { BackgroundEventsStore, namespacedEventId, type BackgroundEventEnvelope } from "../src/background-events.ts";
+import { diagnoseForkRuns, parseSessionTokens, scanAgentSpend, scanBackgroundEvents, scanForkRuns, scanObservationalMemorySpend } from "../src/monitor.ts";
 
 function makeHome(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-forks-test-"));
@@ -12,6 +13,27 @@ function makeHome(): string {
 function writeJson(filePath: string, value: unknown): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function makeEnvelope(overrides: Partial<BackgroundEventEnvelope> = {}): BackgroundEventEnvelope {
+	const source = overrides.source ?? "return_on";
+	const parentNamespace = overrides.parentNamespace ?? "parent-1";
+	const eventId = overrides.eventId ?? namespacedEventId(source, `event-${Math.random().toString(36).slice(2)}`);
+	const workKey = overrides.workKey ?? `${source}:${parentNamespace}:job-1:fired-1`;
+	return {
+		version: 1,
+		source,
+		eventId,
+		workKey,
+		parentNamespace,
+		parent: overrides.parent ?? { sessionId: parentNamespace, cwd: "/tmp/project" },
+		createdAt: overrides.createdAt ?? Date.now(),
+		priority: overrides.priority ?? "normal",
+		payloadPath: overrides.payloadPath ?? "/tmp/payload.json",
+		payloadSha256: overrides.payloadSha256 ?? "0".repeat(64),
+		payloadBytes: overrides.payloadBytes ?? 2,
+		...(overrides.origin !== undefined ? { origin: overrides.origin } : {}),
+	};
 }
 
 function writeSession(sessionDir: string, timestamps = false): void {
@@ -148,6 +170,37 @@ test("diagnoseForkRuns reports stale records and duplicate active cwd groups", (
 	assert.equal(diagnostics.totals.running, 1);
 	assert.ok(diagnostics.issues.some((issue) => issue.kind === "stale_pid" && issue.runIds.includes("icfh_dead")));
 	assert.ok(diagnostics.issues.some((issue) => issue.kind === "duplicate_active_cwd" && issue.cwd === cwd));
+});
+
+test("scanBackgroundEvents reports active queued attached stale failed slot and lineage usage", () => {
+	const home = makeHome();
+	const dbPath = path.join(home, "background-events.sqlite");
+	assert.equal(scanBackgroundEvents({ dbPath: path.join(home, "missing.sqlite") }).exists, false);
+	const store = new BackgroundEventsStore(dbPath);
+	try {
+		store.routeEvent(makeEnvelope({ eventId: "return_on:monitor-active", workKey: "return_on:parent-1:monitor-active", origin: { lineageId: "lin-1" } }), { handlerId: "handler-active", now: 1_000 });
+		store.markHandlerRunning("handler-active", { leaseMs: 100, now: 1_000 });
+		store.routeEvent(makeEnvelope({ eventId: "return_on:monitor-attached", workKey: "return_on:parent-1:monitor-active" }), { now: 1_010 });
+		store.routeEvent(makeEnvelope({ eventId: "return_on:monitor-queued", workKey: "return_on:parent-1:monitor-queued" }), { limits: { global: 0 }, now: 1_020 });
+		store.routeEvent(makeEnvelope({ eventId: "return_on:monitor-failed", workKey: "return_on:parent-1:monitor-failed" }), { handlerId: "handler-failed", now: 1_030 });
+		const resultId = store.completeHandler("handler-failed", { status: "failed", now: 1_040 });
+		store.db.prepare("UPDATE results SET delivery_state = 'failed' WHERE result_id = ?").run(resultId);
+		store.db.prepare("UPDATE lineage_budgets SET max_forkable_followups = 1, used_forkable_followups = 1 WHERE lineage_id = 'lin-1'").run();
+	} finally {
+		store.close();
+	}
+
+	const status = scanBackgroundEvents({ dbPath, now: 1_200 });
+	assert.equal(status.exists, true);
+	assert.equal(status.activeHandlers, 1);
+	assert.equal(status.queuedItems, 1);
+	assert.equal(status.attachedUpdates, 1);
+	assert.equal(status.staleLeases, 1);
+	assert.equal(status.failedDeliveries, 1);
+	assert.ok(status.slotUsed > 0);
+	assert.ok(status.slotLimit >= status.slotUsed);
+	assert.equal(status.lineageBudgets, 1);
+	assert.equal(status.exhaustedForkableLineages, 1);
 });
 
 test("scanObservationalMemorySpend reports visible and full memory token footprint", () => {

@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { diagnoseForkRuns, scanForkRuns, sumRunTokens, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary } from "./monitor.ts";
+import { diagnoseForkRuns, scanBackgroundEvents, scanForkRuns, sumRunTokens, type BackgroundEventsStatus, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary } from "./monitor.ts";
 import {
 	formatDuration,
 	formatTokens,
@@ -137,11 +137,13 @@ function sortRunsForView(runs: ForkRun[], mode: SortMode, reverse: boolean): For
 }
 
 function buildStatus(summary: ForkSummary, _options: ViewOptions, theme?: ThemeLike): string | undefined {
-	if (summary.running.length === 0 && summary.stale.length === 0) return undefined;
+	const background = scanBackgroundEvents();
+	const backgroundActive = background.activeHandlers + background.queuedItems + background.staleLeases + background.failedDeliveries;
+	if (summary.running.length === 0 && summary.stale.length === 0 && backgroundActive === 0) return undefined;
 	const global = summarize({ allSources: true });
 	const globalRunning = global.running.length;
 	const globalStale = global.stale.length;
-	const activeCount = Math.max(summary.running.length + summary.stale.length, globalRunning + globalStale);
+	const activeCount = Math.max(summary.running.length + summary.stale.length, globalRunning + globalStale + backgroundActive);
 	const iconText = forkIcon(activeCount);
 	const color = summary.running.length > 0 || globalRunning > 0 ? "success" : "warning";
 	const icon = theme ? theme.fg(color, iconText) : iconText;
@@ -149,7 +151,8 @@ function buildStatus(summary: ForkSummary, _options: ViewOptions, theme?: ThemeL
 	const staleText = globalStale > 0
 		? globalStale > summary.stale.length ? `${summary.stale.length}/${globalStale} stale` : `${summary.stale.length} stale`
 		: undefined;
-	const countText = [runningText, staleText].filter(Boolean).join(" · ");
+	const backgroundText = backgroundActive > 0 ? `${background.activeHandlers} db active · ${background.queuedItems} queued` : undefined;
+	const countText = [runningText, staleText, backgroundText].filter(Boolean).join(" · ");
 	const count = theme ? theme.fg(color, countText) : countText;
 	const hint = theme ? theme.fg("dim", FORKS_SHORTCUT_LABEL) : FORKS_SHORTCUT_LABEL;
 	return `${icon} ${count} · ${hint}`;
@@ -209,14 +212,25 @@ function formatCommandOutput(summary: ForkSummary, options: ViewOptions, theme?:
 	return [header, "", ...summary.runs.map((run) => formatRunLine(run, theme))].join("\n");
 }
 
+function formatBackgroundEventsStatus(status: BackgroundEventsStatus, theme?: ThemeLike): string[] {
+	const title = theme ? theme.fg("accent", theme.bold("background-events db")) : "background-events db";
+	if (!status.exists) return [`${title}: not initialized`, theme ? theme.fg("dim", status.dbPath) : status.dbPath];
+	return [
+		`${title}: ${status.activeHandlers} active · ${status.queuedItems} queued · ${status.attachedUpdates} attached updates · ${status.staleLeases} stale leases · ${status.failedDeliveries} failed deliveries`,
+		`slots: ${status.slotUsed}/${status.slotLimit} used · lineage budgets: ${status.lineageBudgets} (${status.exhaustedForkableLineages} exhausted forkable)`,
+		status.dbPath,
+	];
+}
+
 function formatDiagnostics(diagnostics: ForkDiagnostics, options: ViewOptions, theme?: ThemeLike): string {
 	const titleText = `${scopeLabel(options)} health`;
 	const title = theme ? theme.fg("accent", theme.bold(titleText)) : titleText;
 	const totals = diagnostics.totals;
 	const header = `${title}: ${totals.tracked} tracked · ${totals.running} running · ${totals.stale} stale · ${totals.failed} failed · ${formatTokens(totals.totalTokens)} tokens`;
 	const lines = [header, `dead-pid active records: ${totals.deadPidRunningRecords}`];
+	lines.push("", ...formatBackgroundEventsStatus(scanBackgroundEvents(), theme));
 	if (diagnostics.issues.length === 0) {
-		lines.push("No health issues found.");
+		lines.push("", "No health issues found.");
 		return lines.join("\n");
 	}
 	lines.push("", "Issues:");

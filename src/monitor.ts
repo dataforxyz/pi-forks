@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { BackgroundEventsStore, getBackgroundEventsDbPath, resolveBackgroundStateRoot } from "./background-events.ts";
 import { buildForkIntercomIdentity, getForkHandlersDir, getForkHandlersFile, getForkStateDir, isProcessAlive, type ForkSource, type ForkStatus } from "./runtime.ts";
 
 export type { ForkSource, ForkStatus } from "./runtime.ts";
@@ -137,6 +138,26 @@ export interface ObservationalMemorySpendSummary {
 	droppedObservations: number;
 }
 
+export interface BackgroundEventsStatus {
+	dbPath: string;
+	exists: boolean;
+	activeHandlers: number;
+	queuedItems: number;
+	attachedUpdates: number;
+	staleLeases: number;
+	failedDeliveries: number;
+	slotUsed: number;
+	slotLimit: number;
+	lineageBudgets: number;
+	exhaustedForkableLineages: number;
+}
+
+export interface BackgroundEventsStatusOptions {
+	dbPath?: string;
+	homeDir?: string;
+	now?: number;
+}
+
 export interface AgentSpendOptions {
 	parentSessionFile?: string;
 	rootDir?: string;
@@ -160,6 +181,52 @@ function readJsonFile<T>(filePath: string): T | undefined {
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		return undefined;
+	}
+}
+
+function emptyBackgroundEventsStatus(dbPath: string, exists: boolean): BackgroundEventsStatus {
+	return {
+		dbPath,
+		exists,
+		activeHandlers: 0,
+		queuedItems: 0,
+		attachedUpdates: 0,
+		staleLeases: 0,
+		failedDeliveries: 0,
+		slotUsed: 0,
+		slotLimit: 0,
+		lineageBudgets: 0,
+		exhaustedForkableLineages: 0,
+	};
+}
+
+function scalarCount(store: BackgroundEventsStore, sql: string, ...params: unknown[]): number {
+	const row = store.db.prepare(sql).get(...params) as { count: number } | undefined;
+	return row?.count ?? 0;
+}
+
+export function scanBackgroundEvents(options: BackgroundEventsStatusOptions = {}): BackgroundEventsStatus {
+	const dbPath = options.dbPath ?? getBackgroundEventsDbPath(resolveBackgroundStateRoot(process.env, options.homeDir ?? os.homedir()));
+	if (!fs.existsSync(dbPath)) return emptyBackgroundEventsStatus(dbPath, false);
+	const now = options.now ?? Date.now();
+	const store = new BackgroundEventsStore(dbPath);
+	try {
+		const slotRow = store.db.prepare("SELECT COALESCE(SUM(used), 0) AS used, COALESCE(SUM(limit_value), 0) AS limitValue FROM slots").get() as { used: number; limitValue: number } | undefined;
+		return {
+			dbPath,
+			exists: true,
+			activeHandlers: scalarCount(store, "SELECT COUNT(*) AS count FROM handlers WHERE state IN ('claimed','handler-starting','handler-running','closing')"),
+			queuedItems: scalarCount(store, "SELECT COUNT(*) AS count FROM queue WHERE state = 'queued'"),
+			attachedUpdates: scalarCount(store, "SELECT COUNT(*) AS count FROM updates"),
+			staleLeases: scalarCount(store, "SELECT COUNT(*) AS count FROM handlers WHERE state = 'handler-running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?", now),
+			failedDeliveries: scalarCount(store, "SELECT COUNT(*) AS count FROM results WHERE delivery_state = 'failed'"),
+			slotUsed: slotRow?.used ?? 0,
+			slotLimit: slotRow?.limitValue ?? 0,
+			lineageBudgets: scalarCount(store, "SELECT COUNT(*) AS count FROM lineage_budgets"),
+			exhaustedForkableLineages: scalarCount(store, "SELECT COUNT(*) AS count FROM lineage_budgets WHERE max_forkable_followups IS NOT NULL AND used_forkable_followups >= max_forkable_followups"),
+		};
+	} finally {
+		store.close();
 	}
 }
 

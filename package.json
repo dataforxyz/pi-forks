@@ -19,7 +19,11 @@
   "exports": {
     ".": "./src/index.ts",
     "./runtime": "./src/runtime.ts",
-    "./src/runtime.ts": "./src/runtime.ts"
+    "./background-events": "./src/background-events.ts",
+    "./background-supervisor": "./src/background-supervisor.ts",
+    "./src/runtime.ts": "./src/runtime.ts",
+    "./src/background-events.ts": "./src/background-events.ts",
+    "./src/background-supervisor.ts": "./src/background-supervisor.ts"
   },
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.ts"
