@@ -33,11 +33,18 @@ export interface ViewOptions {
 	diagnose?: boolean;
 }
 
+export interface StopForkResult {
+	ok: boolean;
+	message: string;
+}
+
 export interface ModalDeps {
 	summarize: (options: ViewOptions) => ForkSummary;
 	scopeLabel: (options: ViewOptions) => string;
 	sourceLabel: (source: ForkRun["source"]) => string;
 	sourceColor: (source: ForkRun["source"]) => string;
+	stopRun?: (run: ForkRun) => Promise<StopForkResult> | StopForkResult;
+	requestRender?: () => void;
 	shortcut: string;
 	shortcutAlias: string;
 	bodyLines: number;
@@ -68,6 +75,8 @@ export class ForksModal {
 	private sortMode: SortMode;
 	private sortDesc: boolean;
 	private cachedLines: string[] | undefined;
+	private statusMessage: StopForkResult | undefined;
+	private stopping = false;
 	private options: ViewOptions;
 	private theme: ThemeLike;
 	private done: () => void;
@@ -112,7 +121,10 @@ export class ForksModal {
 			this.sortDesc = !this.sortDesc;
 			this.resetView();
 		} else if (data === "r") {
+			this.statusMessage = undefined;
 			this.invalidate();
+		} else if (data === "X") {
+			void this.stopSelected(summary);
 		} else if (data === "j" || matchesInput(data, "down")) {
 			this.selectedIndex = Math.min(summary.runs.length - 1, this.selectedIndex + 1);
 			this.ensureSelectedVisible();
@@ -151,7 +163,7 @@ export class ForksModal {
 		const titleCount = globalRunning > summary.running.length ? `${summary.running.length} running/${globalRunning} total` : `${summary.running.length} running`;
 		const title = `${this.theme.fg("success", forkIcon(Math.max(summary.running.length, globalRunning)))} ${this.theme.fg("accent", "fork handlers")} ${this.theme.fg("dim", `${titleCount} · ${summary.runs.length} shown · ${scope}`)}`;
 		const range = body.length > this.deps.bodyLines ? ` · lines ${this.scroll + 1}-${Math.min(body.length, this.scroll + this.deps.bodyLines)}/${body.length}` : "";
-		const help = this.theme.fg("dim", `↑/↓ select · a scope · t related · c completed · s sort · v reverse · Esc/q close${range}`);
+		const help = this.theme.fg("dim", `↑/↓ select · X stop · a scope · t related · c completed · s sort · v reverse · Esc/q close${range}`);
 		return [
 			this.theme.fg("muted", this.border("┌", "┐", frameWidth)),
 			this.frameLine(title, frameWidth),
@@ -193,6 +205,36 @@ export class ForksModal {
 		this.scroll = Math.max(0, this.scroll);
 	}
 
+	private async stopSelected(summary: ForkSummary): Promise<void> {
+		if (this.stopping) return;
+		const run = summary.runs[this.selectedIndex];
+		if (!run) {
+			this.statusMessage = { ok: false, message: "No fork handler selected." };
+			this.invalidate();
+			this.deps.requestRender?.();
+			return;
+		}
+		if (!this.deps.stopRun) {
+			this.statusMessage = { ok: false, message: "Stopping fork handlers is not available in this build." };
+			this.invalidate();
+			this.deps.requestRender?.();
+			return;
+		}
+		this.stopping = true;
+		this.statusMessage = undefined;
+		this.invalidate();
+		this.deps.requestRender?.();
+		try {
+			this.statusMessage = await this.deps.stopRun(run);
+		} catch (error) {
+			this.statusMessage = { ok: false, message: `Failed to stop ${run.label}: ${error instanceof Error ? error.message : String(error)}` };
+		} finally {
+			this.stopping = false;
+			this.invalidate();
+			this.deps.requestRender?.();
+		}
+	}
+
 	private getCachedBodyLength(): number {
 		return this.cachedLines?.length ?? 0;
 	}
@@ -203,6 +245,10 @@ export class ForksModal {
 		const push = (line = "") => lines.push(line);
 		const scope = this.deps.scopeLabel({ ...this.options, scope: this.scope, allSources: this.scope === "all" });
 		push(`${this.theme.fg("dim", "Scope:")} ${this.theme.fg("accent", scope)} ${this.theme.fg("muted", "· related:")} ${this.theme.fg("accent", this.relatedOnly ? "only" : "off")} ${this.theme.fg("muted", "· completed:")} ${this.theme.fg("accent", this.includeCompleted ? "shown" : "hidden")} ${this.theme.fg("muted", "· sort:")} ${this.theme.fg("accent", `${this.sortMode}${this.sortDesc ? " reversed" : ""}`)}`);
+		if (this.statusMessage) {
+			push(this.theme.fg(this.statusMessage.ok ? "success" : "warning", this.statusMessage.message));
+		}
+		if (this.stopping) push(this.theme.fg("warning", "Stopping selected fork handler…"));
 		if (summary.runs.length === 0) {
 			push(this.theme.fg("warning", `No fork handlers for ${scope}.`));
 		} else {

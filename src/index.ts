@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { diagnoseForkRuns, scanBackgroundEvents, scanForkRuns, sumRunTokens, type BackgroundEventsStatus, type ForkDiagnostics, type ForkRun, type ForkSource, type ForkSummary } from "./monitor.ts";
 import {
@@ -10,8 +12,9 @@ import {
 	truncate,
 	type ThemeLike,
 } from "./formatting.ts";
-import { ForksModal, SORT_ORDER, type ModalDeps, type SortMode, type ViewOptions, type ViewScope } from "./modal.ts";
-import { sourceColor, sourceLabel } from "./runtime.ts";
+import { BackgroundEventsStore } from "./background-events.ts";
+import { ForksModal, SORT_ORDER, type ModalDeps, type SortMode, type StopForkResult, type ViewOptions, type ViewScope } from "./modal.ts";
+import { getForkHandlersFile, isProcessAlive, sourceColor, sourceLabel, writeJsonAtomic } from "./runtime.ts";
 
 const EXTENSION_KEY = "pi-forks";
 const WIDGET_KEY = "pi-forks";
@@ -244,11 +247,96 @@ function formatDiagnostics(diagnostics: ForkDiagnostics, options: ViewOptions, t
 }
 
 
+interface SourceHandlerState {
+	runs?: Array<Record<string, unknown>>;
+	handlers?: Array<Record<string, unknown>>;
+}
+
+function signalForkPid(pid: number | undefined): "none" | "signalled" | "not-found" | "permission-denied" {
+	if (!pid || !Number.isInteger(pid) || pid <= 0) return "none";
+	let attempted = false;
+	try {
+		process.kill(-pid, "SIGTERM");
+		return "signalled";
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "EPERM") return "permission-denied";
+		// Negative process group pids are not portable and may fail when the child
+		// is not a group leader. Fall back to signalling the recorded process.
+	}
+	try {
+		attempted = true;
+		process.kill(pid, "SIGTERM");
+		return "signalled";
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ESRCH") return "not-found";
+		if (code === "EPERM") return "permission-denied";
+		return attempted ? "not-found" : "none";
+	}
+}
+
+async function markSourceHandlerStopped(run: ForkRun, now = Date.now()): Promise<boolean> {
+	const filePath = getForkHandlersFile(run.source);
+	let state: SourceHandlerState;
+	try {
+		state = JSON.parse(await fs.promises.readFile(filePath, "utf8")) as SourceHandlerState;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+	const key = run.source === "intercom" ? "runs" : "handlers";
+	const handlers = Array.isArray(state[key]) ? state[key]! : [];
+	let changed = false;
+	for (const handler of handlers) {
+		if (handler.id !== run.id) continue;
+		handler.status = "failed";
+		handler.endedAt ??= now;
+		handler.signal = "SIGTERM";
+		handler.error = "Stopped from pi-forks menu";
+		changed = true;
+	}
+	if (changed) await writeJsonAtomic(filePath, state);
+	return changed;
+}
+
+function markBackgroundEventHandlerStopped(run: ForkRun): void {
+	try {
+		const store = new BackgroundEventsStore();
+		try {
+			store.completeHandler(run.id, {
+				status: "failed",
+				summaryPath: run.dir ? path.join(run.dir, "stderr.log") : getForkHandlersFile(run.source),
+			});
+		} finally {
+			store.close();
+		}
+	} catch {
+		// Legacy handlers or already-completed DB handlers do not need DB cleanup.
+	}
+}
+
+async function stopForkRun(run: ForkRun): Promise<StopForkResult> {
+	if (run.status === "complete" || run.status === "failed") {
+		return { ok: false, message: `${run.label} is already ${run.status}.` };
+	}
+	const alive = isProcessAlive(run.pid);
+	const signalResult = signalForkPid(run.pid);
+	const changed = await markSourceHandlerStopped(run);
+	markBackgroundEventHandlerStopped(run);
+	if (signalResult === "permission-denied") return { ok: false, message: `No permission to stop ${run.label} (pid ${run.pid}).` };
+	if (signalResult === "signalled") return { ok: true, message: `Sent SIGTERM to ${run.label}${run.pid ? ` (pid ${run.pid})` : ""}.` };
+	if (changed) return { ok: true, message: `Marked ${run.label} stopped; no live pid was found${alive === false ? "" : "."}` };
+	return { ok: false, message: `Could not stop ${run.label}; no live pid or handler record was found.` };
+}
+
 const MODAL_DEPS: ModalDeps = {
 	summarize,
 	scopeLabel,
 	sourceLabel,
 	sourceColor,
+	stopRun: stopForkRun,
+	requestRender: () => latestCtx?.ui.requestRender?.(),
 	shortcut: FORKS_SHORTCUT,
 	shortcutAlias: FORKS_SHORTCUT_ALIAS,
 	bodyLines: FORKS_MODAL_BODY_LINES,
