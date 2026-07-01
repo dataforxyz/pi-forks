@@ -300,6 +300,9 @@ function formatDetails(json: string | undefined | null): string {
 function renderText(report: AuditReport, options: CliOptions): string {
 	const lines: string[] = [];
 	const totals = report.diagnostics.totals;
+	const listedRunning = report.runs.filter((run) => run.status === "running").length;
+	const listedStale = report.runs.filter((run) => run.status === "stale").length;
+	const listedFailed = report.runs.filter((run) => run.status === "failed").length;
 	lines.push(`# pi-forks background audit`);
 	lines.push(`generated: ${nowish(report.generatedAt)}`);
 	lines.push("");
@@ -307,7 +310,8 @@ function renderText(report: AuditReport, options: CliOptions): string {
 	lines.push(`background-events db: ${compactPath(report.env.backgroundEventsDbPath)}${report.backgroundEvents.exists ? "" : " (not initialized)"}`);
 	for (const source of SOURCES) lines.push(`${source} state: ${compactPath(report.env.forkStateDirs[source])} · handlers: ${compactPath(report.env.handlerFiles[source])}`);
 	lines.push("");
-	lines.push(`summary: ${totals.tracked} tracked · ${totals.running} running · ${totals.stale} stale · ${totals.failed} failed · ${formatTokens(totals.totalTokens)} tokens`);
+	lines.push(`run list: ${report.runs.length} tracked · ${listedRunning} running · ${listedStale} stale · ${listedFailed} failed${report.runs.length === 0 ? " (use --all to include completed/legacy records)" : ""}`);
+	lines.push(`health scan: ${totals.tracked} tracked · ${totals.running} running · ${totals.stale} stale · ${totals.failed} failed · ${formatTokens(totals.totalTokens)} tokens`);
 	lines.push(`background-events: ${report.backgroundEvents.activeHandlers} active · ${report.backgroundEvents.queuedItems} queued · ${report.backgroundEvents.attachedUpdates} attached updates · ${report.backgroundEvents.staleLeases} stale leases · ${report.backgroundEvents.failedDeliveries} failed deliveries · slots ${report.backgroundEvents.slotUsed}/${report.backgroundEvents.slotLimit}`);
 	lines.push(...sourceCounts(report.runs));
 	lines.push("");
