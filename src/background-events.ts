@@ -330,9 +330,12 @@ export class BackgroundEventsStore {
 	constructor(dbPath = getBackgroundEventsDbPath()) {
 		this.dbPath = dbPath;
 		fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
-		this.db = new DatabaseSync(dbPath);
-		this.db.exec("PRAGMA journal_mode = WAL");
+		// Set the open timeout before any PRAGMA/migration work. Monitor/status paths
+		// can instantiate the store while another handler owns a write lock; without
+		// a constructor timeout the first PRAGMA can throw SQLITE_BUSY immediately.
+		this.db = new DatabaseSync(dbPath, { timeout: 5_000 });
 		this.db.exec("PRAGMA busy_timeout = 5000");
+		this.db.exec("PRAGMA journal_mode = WAL");
 		this.db.exec("PRAGMA foreign_keys = ON");
 		this.migrate();
 	}

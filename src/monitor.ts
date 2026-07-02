@@ -209,8 +209,9 @@ export function scanBackgroundEvents(options: BackgroundEventsStatusOptions = {}
 	const dbPath = options.dbPath ?? getBackgroundEventsDbPath(resolveBackgroundStateRoot(process.env, options.homeDir ?? os.homedir()));
 	if (!fs.existsSync(dbPath)) return emptyBackgroundEventsStatus(dbPath, false);
 	const now = options.now ?? Date.now();
-	const store = new BackgroundEventsStore(dbPath);
+	let store: BackgroundEventsStore | undefined;
 	try {
+		store = new BackgroundEventsStore(dbPath);
 		const slotRow = store.db.prepare("SELECT COALESCE(SUM(used), 0) AS used, COALESCE(SUM(limit_value), 0) AS limitValue FROM slots").get() as { used: number; limitValue: number } | undefined;
 		return {
 			dbPath,
@@ -225,8 +226,13 @@ export function scanBackgroundEvents(options: BackgroundEventsStatusOptions = {}
 			lineageBudgets: scalarCount(store, "SELECT COUNT(*) AS count FROM lineage_budgets"),
 			exhaustedForkableLineages: scalarCount(store, "SELECT COUNT(*) AS count FROM lineage_budgets WHERE max_forkable_followups IS NOT NULL AND used_forkable_followups >= max_forkable_followups"),
 		};
+	} catch {
+		// Status/footer rendering must never crash Pi. A writer can briefly hold the
+		// SQLite lock while routing or completing a handler; report the DB as present
+		// but temporarily unavailable and try again on the next refresh.
+		return emptyBackgroundEventsStatus(dbPath, true);
 	} finally {
-		store.close();
+		store?.close();
 	}
 }
 

@@ -300,6 +300,16 @@ async function markSourceHandlerStopped(run: ForkRun, now = Date.now()): Promise
 	return changed;
 }
 
+function sanitizeInspectionText(value: string, maxLength = 500): string {
+	return value
+		// OSC and CSI/control escape sequences can rewrite terminal state; logs are
+		// local but still untrusted display input.
+		.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
+		.replace(/\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "")
+		.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
+		.slice(0, maxLength);
+}
+
 function readTailLines(filePath: string | undefined, maxLines = 20, maxBytes = 12_000): string[] {
 	if (!filePath) return [];
 	try {
@@ -310,10 +320,63 @@ function readTailLines(filePath: string | undefined, maxLines = 20, maxBytes = 1
 			const bytes = Math.min(maxBytes, stat.size);
 			const buffer = Buffer.alloc(bytes);
 			fs.readSync(fd, buffer, 0, bytes, stat.size - bytes);
-			return buffer.toString("utf8").split(/\r?\n/).filter((line) => line.length > 0).slice(-maxLines);
+			return buffer.toString("utf8").split(/\r?\n/).map((line) => sanitizeInspectionText(line)).filter((line) => line.length > 0).slice(-maxLines);
 		} finally {
 			fs.closeSync(fd);
 		}
+	} catch {
+		return [];
+	}
+}
+
+function readJsonFileLocal<T>(filePath: string): T | undefined {
+	try {
+		return JSON.parse(fs.readFileSync(filePath, "utf8")) as T;
+	} catch {
+		return undefined;
+	}
+}
+
+function getSourceRunRecord(run: ForkRun): Record<string, unknown> | undefined {
+	const state = readJsonFileLocal<SourceHandlerState>(getForkHandlersFile(run.source));
+	const key = run.source === "intercom" ? "runs" : "handlers";
+	const handlers = Array.isArray(state?.[key]) ? state[key]! : [];
+	return handlers.find((handler) => handler.id === run.id);
+}
+
+function stringField(record: Record<string, unknown> | undefined, key: string): string | undefined {
+	const value = record?.[key];
+	return typeof value === "string" && value.trim() ? sanitizeInspectionText(value.trim(), 2_000) : undefined;
+}
+
+function latestSessionActivity(sessionDir: string | undefined, maxLines = 8): string[] {
+	if (!sessionDir) return [];
+	try {
+		const files = fs.readdirSync(sessionDir)
+			.filter((name) => name.endsWith(".jsonl"))
+			.map((name) => path.join(sessionDir, name))
+			.map((file) => ({ file, mtime: fs.statSync(file).mtimeMs }))
+			.sort((a, b) => b.mtime - a.mtime);
+		const latest = files[0]?.file;
+		if (!latest) return [];
+		const rows = readTailLines(latest, 120, 80_000);
+		const activity: string[] = [];
+		for (const row of rows) {
+			let parsed: unknown;
+			try { parsed = JSON.parse(row); } catch { continue; }
+			if (!parsed || typeof parsed !== "object") continue;
+			const record = parsed as Record<string, unknown>;
+			const lower = JSON.stringify({ type: record.type, role: record.role, customType: record.customType, name: record.name }).toLowerCase();
+			if (/thinking|reasoning|thought/.test(lower)) {
+				activity.push("reasoning/thinking step recorded (content hidden)");
+				continue;
+			}
+			const type = typeof record.type === "string" ? record.type : typeof record.customType === "string" ? record.customType : "entry";
+			const role = typeof record.role === "string" ? `${record.role} ` : "";
+			const name = typeof record.name === "string" ? ` ${record.name}` : "";
+			activity.push(`${role}${type}${name}`.trim());
+		}
+		return activity.slice(-maxLines);
 	} catch {
 		return [];
 	}
@@ -328,6 +391,13 @@ function describeForkRun(run: ForkRun): string[] {
 	const stderrPath = run.dir ? path.join(run.dir, "stderr.log") : undefined;
 	const stdout = readTailLines(stdoutPath, 12);
 	const stderr = readTailLines(stderrPath, 8);
+	const sourceRecord = getSourceRunRecord(run);
+	const summary = stringField(sourceRecord, "summary");
+	const error = stringField(sourceRecord, "error");
+	const messageId = stringField(sourceRecord, "messageId");
+	const jobId = stringField(sourceRecord, "jobId");
+	const eventType = stringField(sourceRecord, "type");
+	const activity = latestSessionActivity(run.sessionDir);
 	const lines = [
 		`id: ${run.source}/${run.id}`,
 		`status: ${run.status}${run.rawStatus ? ` (raw ${run.rawStatus})` : ""}${run.pid ? ` · pid ${run.pid}${run.pidAlive === false ? " dead" : ""}` : ""}`,
@@ -341,8 +411,14 @@ function describeForkRun(run: ForkRun): string[] {
 		run.parentSessionName ? `parent session: ${run.parentSessionName}` : undefined,
 		run.parentSessionId ? `parent session id: ${run.parentSessionId}` : undefined,
 		run.detail ? `detail: ${run.detail}` : undefined,
+		messageId ? `message id: ${messageId}` : undefined,
+		jobId ? `job id: ${jobId}` : undefined,
+		eventType ? `event type: ${eventType}` : undefined,
+		summary ? `summary: ${summary}` : undefined,
+		error ? `error: ${error}` : undefined,
 		run.dir ? `handler dir: ${run.dir}` : undefined,
 		run.sessionDir ? `session dir: ${run.sessionDir}` : undefined,
+		...(activity.length > 0 ? ["recent session activity:", ...activity.map((line) => `  ${line}`)] : []),
 		stdoutPath ? `stdout: ${stdoutPath}` : undefined,
 		...(stdout.length > 0 ? ["stdout tail:", ...stdout.map((line) => `  ${line}`)] : ["stdout tail: <empty or unavailable>"]),
 		stderrPath ? `stderr: ${stderrPath}` : undefined,
@@ -375,14 +451,15 @@ function currentSessionIsForkHandler(): boolean {
 	return !!getForkHandlerIdentity(process.env);
 }
 
-function canControlRun(run: ForkRun, ctx = latestCtx): StopForkResult | undefined {
+function canControlRun(run: ForkRun, ctx: ExtensionContext | undefined = latestCtx): StopForkResult | undefined {
 	if (currentSessionIsForkHandler()) return { ok: false, message: "Fork handler sessions may inspect forks, but only the parent/main dialog can pause, resume, or stop fork handlers." };
 	const scope = sessionScope(ctx);
-	if (Object.keys(scope).length > 0 && !runMatchesCurrentSession(run, scope)) return { ok: false, message: `Refusing to control ${run.label}; it is not owned by this main dialog/session.` };
+	if (Object.keys(scope).length === 0) return { ok: false, message: "Refusing to control fork handlers without a current parent/main session identity." };
+	if (!runMatchesCurrentSession(run, scope)) return { ok: false, message: `Refusing to control ${run.label}; it is not owned by this main dialog/session.` };
 	return undefined;
 }
 
-async function controlForkRun(run: ForkRun, action: ForkControlAction, ctx = latestCtx): Promise<StopForkResult> {
+async function controlForkRun(run: ForkRun, action: ForkControlAction, ctx: ExtensionContext | undefined = latestCtx): Promise<StopForkResult> {
 	const denied = canControlRun(run, ctx);
 	if (denied) return denied;
 	if ((action === "stop" && (run.status === "complete" || run.status === "failed")) || (action !== "stop" && run.status !== "running")) {
@@ -515,7 +592,7 @@ function stopRefresh(ctx = latestCtx): void {
 }
 
 async function notifyScoped(ctx: ExtensionContext, source: ForkSource, includeCompleted = false): Promise<void> {
-	await showForksModal(ctx, { source, includeCompleted });
+	await showForksModal(ctx, { source, includeCompleted, relatedOnly: false, ...sessionScope(ctx) });
 }
 
 interface ForksToolParams {
@@ -527,13 +604,24 @@ interface ForksToolParams {
 	limit?: number;
 }
 
-function resolveForkTarget(id: string | undefined, source: ForkSource | undefined, ctx = latestCtx): { run?: ForkRun; error?: string } {
+function matchingForkTargets(id: string, runs: ForkRun[]): ForkRun[] {
+	const exact = runs.filter((run) => run.id === id);
+	return exact.length > 0 ? exact : runs.filter((run) => run.id.startsWith(id));
+}
+
+function resolveForkTarget(id: string | undefined, source: ForkSource | undefined, ctx: ExtensionContext | undefined = latestCtx, options: { ownedOnly?: boolean } = {}): { run?: ForkRun; error?: string } {
 	const needle = id?.trim();
 	if (!needle) return { error: "Provide a fork handler id or unambiguous id prefix." };
 	const runs = scanForkRuns({ includeCompleted: true, ...(source ? { source } : {}) }).runs;
-	const exact = runs.filter((run) => run.id === needle);
-	const candidates = exact.length > 0 ? exact : runs.filter((run) => run.id.startsWith(needle));
-	if (candidates.length === 0) return { error: `No fork handler matched ${needle}${source ? ` in ${source}` : ""}.` };
+	const scope = sessionScope(ctx);
+	const ownedRuns = Object.keys(scope).length > 0 ? runs.filter((run) => runMatchesCurrentSession(run, scope)) : [];
+	const searchRuns = options.ownedOnly ? ownedRuns : ownedRuns.length > 0 ? ownedRuns : runs;
+	const candidates = matchingForkTargets(needle, searchRuns);
+	if (candidates.length === 0) {
+		const anyCandidates = matchingForkTargets(needle, runs);
+		if (options.ownedOnly && anyCandidates.length > 0) return { error: `Fork handler ${needle} exists but is not owned by this main dialog/session.` };
+		return { error: `No fork handler matched ${needle}${source ? ` in ${source}` : ""}.` };
+	}
 	if (candidates.length > 1) return { error: `Fork handler id ${needle} is ambiguous: ${candidates.slice(0, 8).map((run) => `${run.source}/${run.id}`).join(", ")}${candidates.length > 8 ? ", …" : ""}` };
 	return { run: candidates[0] };
 }
@@ -549,8 +637,8 @@ function formatAgentForkList(options: ViewOptions, limit: number): string {
 	return [formatCommandOutput(summary, options), "", guidance, ...handlerSection].join("\n");
 }
 
-async function runForkControlAction(action: ForkControlAction, id: string | undefined, source: ForkSource | undefined, ctx = latestCtx): Promise<StopForkResult> {
-	const resolved = resolveForkTarget(id, source, ctx);
+async function runForkControlAction(action: ForkControlAction, id: string | undefined, source: ForkSource | undefined, ctx: ExtensionContext | undefined = latestCtx): Promise<StopForkResult> {
+	const resolved = resolveForkTarget(id, source, ctx, { ownedOnly: true });
 	if (!resolved.run) return { ok: false, message: resolved.error ?? "No fork handler selected." };
 	return controlForkRun(resolved.run, action, ctx);
 }
@@ -601,19 +689,20 @@ function registerForksTool(pi: ExtensionAPI): void {
 			required: ["action"],
 			additionalProperties: false,
 		},
-		async execute(_toolCallId: string, params: ForksToolParams) {
+		async execute(_toolCallId: string, params: ForksToolParams, _signal?: AbortSignal, _onUpdate?: unknown, ctx?: ExtensionContext) {
+			const toolCtx = ctx ?? latestCtx;
 			const action = params.action ?? "list";
 			const limit = Math.max(1, Math.min(200, Number.isFinite(params.limit) ? Math.floor(params.limit ?? 25) : 25));
 			if (action === "pause" || action === "resume" || action === "stop") {
-				const result = await runForkControlAction(action, params.id, params.source, latestCtx);
+				const result = await runForkControlAction(action, params.id, params.source, toolCtx);
 				return { content: [{ type: "text", text: result.message }], details: result };
 			}
 			if (action === "inspect") {
-				const resolved = resolveForkTarget(params.id, params.source, latestCtx);
+				const resolved = resolveForkTarget(params.id, params.source, toolCtx);
 				if (!resolved.run) return { content: [{ type: "text", text: resolved.error ?? "No fork handler selected." }], details: { ok: false, error: resolved.error } };
 				return { content: [{ type: "text", text: inspectForkRun(resolved.run) }], details: { ok: true, id: resolved.run.id, source: resolved.run.source } };
 			}
-			const base = params.all ? { scope: "all" as const, allSources: true, relatedOnly: false } : defaultOptions(latestCtx) ?? { scope: "chat" as const, relatedOnly: true };
+			const base = params.all ? { scope: "all" as const, allSources: true, relatedOnly: false } : defaultOptions(toolCtx) ?? { scope: "chat" as const, relatedOnly: true };
 			const options = { ...base, includeCompleted: !!params.includeCompleted, ...(params.source && !params.all ? { source: params.source } : {}) } satisfies ViewOptions;
 			const text = action === "audit"
 				? formatDiagnostics(diagnoseForkRuns({ includeCompleted: true, ...(params.source ? { source: params.source } : {}) }), { ...options, includeCompleted: true, allSources: params.all ?? !params.source })
