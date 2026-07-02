@@ -74,6 +74,7 @@ export interface DequeueQueuedOptions {
 	limits?: SlotLimitConfig;
 	now?: number;
 	handlerId?: string;
+	source?: BackgroundEventSource;
 }
 
 export interface DequeueQueuedResult {
@@ -125,6 +126,7 @@ export interface ReconcilerPassOptions {
 	now?: number;
 	dequeueLimit?: number;
 	limits?: SlotLimitConfig;
+	source?: BackgroundEventSource;
 	isProcessAlive?: (pid: number) => boolean;
 }
 
@@ -596,13 +598,21 @@ export class BackgroundEventsStore {
 		const now = options.now ?? Date.now();
 		this.db.exec("BEGIN IMMEDIATE");
 		try {
-			const queued = this.db.prepare(`
-				SELECT queue_id, parent_namespace, source, work_key, priority
-				FROM queue
-				WHERE state = 'queued'
-				ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, created_at, queue_id
-				LIMIT 1
-			`).get() as { queue_id: string; parent_namespace: string; source: BackgroundEventSource; work_key: string; priority: BackgroundPriority } | undefined;
+			const queued = (options.source
+				? this.db.prepare(`
+					SELECT queue_id, parent_namespace, source, work_key, priority
+					FROM queue
+					WHERE state = 'queued' AND source = ?
+					ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, created_at, queue_id
+					LIMIT 1
+				`).get(options.source)
+				: this.db.prepare(`
+					SELECT queue_id, parent_namespace, source, work_key, priority
+					FROM queue
+					WHERE state = 'queued'
+					ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, created_at, queue_id
+					LIMIT 1
+				`).get()) as { queue_id: string; parent_namespace: string; source: BackgroundEventSource; work_key: string; priority: BackgroundPriority } | undefined;
 			if (!queued) {
 				this.db.exec("COMMIT");
 				return { disposition: "empty" };
@@ -875,7 +885,7 @@ export class BackgroundEventsStore {
 		const launchBundles: HandlerLaunchBundle[] = [];
 		const limit = Math.max(0, options.dequeueLimit ?? 1);
 		for (let index = 0; index < limit; index += 1) {
-			const result = this.dequeueNextQueued({ limits: options.limits, now });
+			const result = this.dequeueNextQueued({ limits: options.limits, now, source: options.source });
 			if (result.disposition === "empty") break;
 			dequeued.push(result);
 			if (result.disposition === "handler-starting" && result.handlerId) {

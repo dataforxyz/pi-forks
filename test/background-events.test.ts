@@ -161,6 +161,23 @@ test("getHandlerLaunchBundle materializes handler work and payload events", asyn
 	});
 });
 
+test("source-filtered dequeue does not claim other-source queued work", async () => {
+	await withStore((store) => {
+		const intercom = makeEnvelope({ source: "intercom", eventId: "intercom:queued-first", workKey: "intercom:parent-1:message:queued-first", createdAt: 1_000 });
+		const ret = makeEnvelope({ source: "return_on", eventId: "return_on:queued-second", workKey: "return_on:parent-1:job:queued-second", createdAt: 2_000 });
+		assert.equal(store.routeEvent(intercom, { limits: { global: 0 }, now: 1_000 }).disposition, "queued");
+		assert.equal(store.routeEvent(ret, { limits: { global: 0 }, now: 2_000 }).disposition, "queued");
+		const claimedReturnOn = store.dequeueNextQueued({ source: "return_on", limits: { global: 1 }, handlerId: "handler-return-on", now: 3_000 });
+		assert.equal(claimedReturnOn.disposition, "handler-starting");
+		assert.equal(claimedReturnOn.handlerId, "handler-return-on");
+		const intercomQueue = store.db.prepare("SELECT state FROM queue WHERE source = 'intercom'").get() as { state: string };
+		assert.equal(intercomQueue.state, "queued");
+		const claimedIntercom = store.dequeueNextQueued({ source: "intercom", limits: { global: 2 }, handlerId: "handler-intercom", now: 4_000 });
+		assert.equal(claimedIntercom.disposition, "handler-starting");
+		assert.equal(claimedIntercom.handlerId, "handler-intercom");
+	});
+});
+
 test("dequeueNextQueued attaches queued updates if an active handler appeared", async () => {
 	await withStore((store) => {
 		const first = makeEnvelope({ eventId: "return_on:queued-attach-1", workKey: "return_on:parent-1:job:queued-attach", createdAt: 1_000 });
