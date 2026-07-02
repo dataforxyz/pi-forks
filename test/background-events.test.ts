@@ -263,9 +263,10 @@ test("handler heartbeat lifecycle releases slots and records one delivered work 
 		const slots = store.db.prepare("SELECT used FROM slots").all() as Array<{ used: number }>;
 		assert.equal(slots.every((row) => row.used === 0), true);
 		const duplicateResult = store.completeHandler("handler-1", { summaryPath: "/tmp/summary-2.md", now: 3_000 });
-		assert.equal(duplicateResult, undefined);
-		const results = store.db.prepare("SELECT result_id FROM results").all() as Array<{ result_id: string }>;
+		assert.equal(duplicateResult, resultId);
+		const results = store.db.prepare("SELECT result_id, summary_path FROM results").all() as Array<{ result_id: string; summary_path: string }>;
 		assert.equal(results.length, 1);
+		assert.equal(results[0]?.summary_path, "/tmp/summary-2.md");
 	});
 });
 

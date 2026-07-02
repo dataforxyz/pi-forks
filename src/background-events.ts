@@ -814,10 +814,18 @@ export class BackgroundEventsStore {
 			this.db.prepare("UPDATE handlers SET state = ?, ended_at = ?, updated_at = ? WHERE handler_id = ?").run(status === "complete" ? "completed" : status, now, now, handlerId);
 			this.db.prepare("UPDATE work_items SET state = ?, active_handler_id = NULL, updated_at = ? WHERE parent_namespace = ? AND source = ? AND work_key = ?")
 				.run(status === "complete" ? "completed" : status, now, handler.parent_namespace, handler.source, handler.work_key);
-			const alreadyDelivered = this.db.prepare("SELECT delivered_result_id FROM work_results WHERE parent_namespace = ? AND source = ? AND work_key = ? AND delivered_result_id IS NOT NULL")
-				.get(handler.parent_namespace, handler.source, handler.work_key) as { delivered_result_id: string } | undefined;
+			const existingResult = this.db.prepare(`
+				SELECT r.result_id, r.delivery_state
+				FROM work_results wr
+				JOIN results r ON r.result_id = wr.delivered_result_id
+				WHERE wr.parent_namespace = ? AND wr.source = ? AND wr.work_key = ? AND wr.delivered_result_id IS NOT NULL
+			`).get(handler.parent_namespace, handler.source, handler.work_key) as { result_id: string; delivery_state: string } | undefined;
 			let resultId: string | undefined;
-			if (!alreadyDelivered) {
+			if (existingResult?.delivery_state === "pending") {
+				resultId = existingResult.result_id;
+				this.db.prepare("UPDATE results SET status = ?, summary_path = ?, updated_at = ? WHERE result_id = ? AND delivery_state = 'pending'")
+					.run(status, input.summaryPath ?? "", now, resultId);
+			} else if (!existingResult) {
 				resultId = `ber_${randomUUID()}`;
 				const ackKey = `${handlerId}:${resultId}`;
 				const eventRows = this.db.prepare("SELECT event_id FROM events WHERE parent_namespace = ? AND source = ? AND work_key = ? ORDER BY created_at, event_id")
